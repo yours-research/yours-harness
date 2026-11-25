@@ -1,0 +1,35 @@
+export {
+  StreamOutputParser,
+  parseLenientJsonObject,
+  extractToolCallFromPayload,
+  type ParsedToolCall,
+  type StreamParserOptions,
+  type StreamParserStepOutput,
+} from './streamParser.js';
+export {
+  extractStableDraftPrefix,
+  TypingSpeculativePrefillController,
+  ActiveTabSpeculativePrefillController,
+  PrefixSlotCoordinator,
+  BASE_SYSTEM_SLOT_ID,
+  TURN_CHECKPOINT_SLOT_ID,
+  type TypingSpeculativePrefillOptions,
+  type ExtractedActiveTab,
+  type ActiveTabSpeculativePrefillOptions,
+  type PrefixSlotKind,
+  type PrefixSlotMeta,
+  type PrefixSlotRecord,
+  type PrefixSlotMatch,
+  type PrefixSlotCoordinatorOptions,
+} from './speculative.js';
+export {
+  TurnStateMachine,
+  runHarnessTurn,
+  type TurnState,
+  type TurnStateTransition,
+  type PendingApprovalRequest,
+  type ExecutedToolTrace,
+  type TurnTelemetrySnapshot,
+  type RunHarnessTurnParams,
+  type RunHarnessTurnResult,
+} from './turnStateMachine.js';

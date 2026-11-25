@@ -1,0 +1,86 @@
+{
+  "name": "@yours/harness",
+  "version": "0.1.0",
+  "description": "Runtime-agnostic local LLM chat & agent harness SDK with KV-cache-preserving context compaction, crash-recoverable local persistence, speculative prefix scheduling, and UI hooks.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapters": {
+      "types": "./dist/adapters/index.d.ts",
+      "import": "./dist/adapters/index.js"
+    },
+    "./compaction": {
+      "types": "./dist/compaction/index.d.ts",
+      "import": "./dist/compaction/index.js"
+    },
+    "./engine": {
+      "types": "./dist/engine/index.d.ts",
+      "import": "./dist/engine/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js"
+    },
+    "./controller": {
+      "types": "./dist/controller/index.d.ts",
+      "import": "./dist/controller/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "ARCHITECTURE.md",
+    "CONTRIBUTING.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yours-research/yours-harness.git"
+  },
+  "homepage": "https://yours.sh",
+  "keywords": [
+    "llm",
+    "agent",
+    "webgpu",
+    "local-ai",
+    "kv-cache",
+    "context-compaction",
+    "speculative-prefill",
+    "chrome-extension",
+    "mv3",
+    "yours-research"
+  ]
+}
