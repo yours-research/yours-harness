@@ -18,6 +18,24 @@ export interface ToolFoldingResult {
 
 const TOOL_RESULT_TAG_RE = /^<tool_result\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/tool_result>/i;
 const URL_RE = /https?:\/\/[^\s)>\]"']+/gi;
+const SPOTLIGHT_MARKER_RE = /^\[(?:BEGIN|END)\s+UNTRUSTED CONTENT\b[^\]]*\]$/i;
+const SALIENCE_CODE_RE = /\b[A-Z]{2,}[_-][A-Z0-9_-]+\b/g;
+const SALIENCE_NUM_RE = /(?:[$€£¥]?\d[\d.,:%-]*|\b\d{3,5}\b)/g;
+
+function scoreToolLineSalience(line: string, index: number): number {
+  let score = index === 0 ? 1.5 : 0;
+  const codes = line.match(SALIENCE_CODE_RE)?.length ?? 0;
+  const nums = line.match(SALIENCE_NUM_RE)?.length ?? 0;
+  const urls = line.match(URL_RE)?.length ?? 0;
+  score += Math.min(8, codes * 3 + nums * 1.4 + urls * 1.5);
+  if (/\b(cookie|privacy policy|skip to content|all rights reserved|subscribe|sign in)\b/i.test(line)) {
+    score -= 4;
+  }
+  if (line.length >= 20 && line.length <= 140) {
+    score += 0.8;
+  }
+  return score;
+}
 
 function isToolPayloadMessage(msg: HarnessMessage): boolean {
   if (msg.role === 'tool') {
@@ -51,12 +69,42 @@ function extractToolNameAndBody(msg: HarnessMessage): { toolName: string; body: 
 
 function extractCitationSummary(toolName: string, body: string, excerptMaxChars: number): string {
   const urls = Array.from(new Set(body.match(URL_RE) ?? [])).slice(0, 3);
-  const lines = body
+  const contentLines = body
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith('<') && !line.startsWith('{'));
+    .filter(
+      (line) =>
+        line.length > 0 &&
+        !SPOTLIGHT_MARKER_RE.test(line) &&
+        !/^URL:\s*https?:\/\//i.test(line) &&
+        !line.startsWith('<') &&
+        !line.startsWith('{'),
+    );
 
-  const headline = (lines[0] ?? body.replace(/\s+/g, ' ').trim()).slice(0, excerptMaxChars);
+  const scored = contentLines
+    .map((line, idx) => ({ line, idx, score: scoreToolLineSalience(line, idx) }))
+    .sort((a, b) => b.score - a.score || a.idx - b.idx);
+
+  const picked: Array<{ line: string; idx: number }> = [];
+  let used = 0;
+  const budget = Math.max(80, excerptMaxChars);
+  for (const item of scored) {
+    const clean = item.line.replace(/\s+/g, ' ');
+    const needed = clean.length + (picked.length > 0 ? 3 : 0);
+    if (used + needed <= budget) {
+      picked.push({ line: clean, idx: item.idx });
+      used += needed;
+      if (used >= budget - 24) break;
+    } else if (picked.length === 0) {
+      picked.push({ line: `${clean.slice(0, Math.max(0, budget - 3)).trimEnd()}...`, idx: item.idx });
+      used = budget;
+      break;
+    }
+  }
+
+  picked.sort((a, b) => a.idx - b.idx);
+  const fallback = body.replace(SPOTLIGHT_MARKER_RE, '').replace(/\s+/g, ' ').trim().slice(0, budget);
+  const headline = picked.length > 0 ? picked.map((p) => p.line).join(' | ') : fallback;
   const originalTokens = estimateTextTokens(body);
 
   const parts = [
@@ -66,8 +114,7 @@ function extractCitationSummary(toolName: string, body: string, excerptMaxChars:
     parts.push(`Sources: ${urls.join(', ')}`);
   }
   if (headline) {
-    const ellipsis = headline.length >= excerptMaxChars ? '...' : '';
-    parts.push(`Summary: ${headline}${ellipsis}`);
+    parts.push(`Summary: ${headline}`);
   }
   return parts.join(' ');
 }
@@ -102,7 +149,7 @@ export function foldTransientToolResults(
 ): ToolFoldingResult {
   const preserveRecentTurns = Math.max(1, options.preserveRecentTurns ?? 1);
   const foldThresholdChars = Math.max(80, options.foldThresholdChars ?? 360);
-  const excerptMaxChars = Math.max(40, options.excerptMaxChars ?? 180);
+  const excerptMaxChars = Math.max(40, options.excerptMaxChars ?? 220);
 
   if (messages.length === 0) {
     return { messages: [], foldedCount: 0, savedTokensEstimate: 0 };
