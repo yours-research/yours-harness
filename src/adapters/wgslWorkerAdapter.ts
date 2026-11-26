@@ -233,10 +233,11 @@ export class WgslWorkerAdapter implements RuntimeAdapter {
         type: 'PREFILL_BACKGROUND',
         requestId,
         slotKey,
+        isDraft: slotKey.startsWith('draft:'),
         messages: messages.map((m) => ({
           id: m.id,
           role: m.role,
-          content: m.content,
+          content: m.rawContent ?? m.content,
           toolName: m.toolName,
           toolCallId: m.toolCallId,
         })),
@@ -369,7 +370,7 @@ export class WgslWorkerAdapter implements RuntimeAdapter {
       messages: request.messages.map((m) => ({
         id: m.id,
         role: m.role,
-        content: m.content,
+        content: m.rawContent ?? m.content,
         toolName: m.toolName,
         toolCallId: m.toolCallId,
         toolArgs: m.toolArgs,
@@ -380,6 +381,8 @@ export class WgslWorkerAdapter implements RuntimeAdapter {
           : request.tools
         : undefined,
       prefixSlotKey: request.prefixSlotKey,
+      ...(request.stopOnToolCall ? { stopOnToolCall: true } : {}),
+      ...(request.groundingText ? { groundingText: request.groundingText } : {}),
       config: {
         maxNewTokens: request.maxNewTokens,
         temperature: request.temperature,

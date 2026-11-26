@@ -3,11 +3,14 @@ import type {
   GenerateRequest,
   GuardEngine,
   HarnessMessage,
+  MemoryProvider,
+  MemoryRecord,
   RuntimeAdapter,
   StreamDelta,
   ToolDefinition,
   ToolExecutor,
 } from '../src/contracts.js';
+import { PrefixSlotCoordinator } from '../src/engine/speculative.js';
 import { runHarnessTurn, TurnStateMachine } from '../src/engine/turnStateMachine.js';
 
 function createMockAdapter(
@@ -281,5 +284,231 @@ describe('TurnStateMachine & Agentic Turn Runner', () => {
     expect(result.newMessages[2]?.role).toBe('assistant');
     expect(result.newMessages[2]?.content).toBe('Summary ready.');
     expect(result.newMessages[2]?.reasoning).toBe('Got tab');
+  });
+
+  it('aborts step immediately on stopOnToolCall without aborting turn, clears buffers, and forwards groundingText + rawContent', async () => {
+    const requests: GenerateRequest[] = [];
+    const stepSignals: AbortSignal[] = [];
+    const prefillCalls: string[] = [];
+
+    const adapter: RuntimeAdapter = {
+      capabilities: () => ({
+        id: 'stop-on-tc-adapter',
+        maxContextTokens: 8192,
+        supportsStreaming: true,
+        supportsPrefixSlots: true,
+        supportsTools: true,
+        tier: 'tier1-f16-subgroups',
+      }),
+      countTokens: (msgs) => msgs.reduce((acc, m) => acc + Math.ceil((m.rawContent ?? m.content).length / 4) + 4, 0),
+      async prefillSlot(slotKey) {
+        prefillCalls.push(slotKey);
+        return { tokens: 16, elapsedMs: 1 };
+      },
+      async *generate(req, signal) {
+        requests.push(req);
+        if (signal) {
+          stepSignals.push(signal);
+        }
+        if (requests.length === 1) {
+          yield {
+            type: 'text',
+            delta: '<|channel>thought\nNeed tab\n<channel|><|tool_call>call:read_active_tab{}<tool_call|>',
+          };
+          // Even if adapter would hang waiting for step abort, stepAbortController aborts immediately
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) {
+              resolve();
+            } else {
+              signal?.addEventListener('abort', () => resolve(), { once: true });
+            }
+          });
+          yield { type: 'text', delta: 'HALLUCINATED AFTER TOOL' };
+          yield { type: 'done', finishReason: 'abort' };
+          return;
+        }
+        yield { type: 'text', delta: '  Final answer with leading space  ' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+    };
+
+    const slotCoordinator = new PrefixSlotCoordinator({ adapter });
+    const toolExecutor: ToolExecutor = {
+      listTools: () => TOOLS,
+      async execute(name) {
+        return {
+          ok: true,
+          toolName: name,
+          formatted: 'Observed tab fact A',
+          tainted: false,
+        };
+      },
+    };
+
+    const textEvents: Array<{ delta: string; acc: string; step: number }> = [];
+    const reasoningEvents: Array<{ delta: string; acc: string; step: number }> = [];
+    const outerController = new AbortController();
+
+    const result = await runHarnessTurn({
+      sessionId: 'sess_stop_tc',
+      adapter,
+      messages: [{ id: 'u1', role: 'user', content: 'Check tab', createdAt: 1 }],
+      contextMessages: [{ id: 'ctx1', role: 'system', content: 'Tab title: Docs', createdAt: 1 }],
+      groundingText: 'Seed grounding text',
+      tools: TOOLS,
+      toolExecutor,
+      slotCoordinator,
+      signal: outerController.signal,
+      onTextDelta: (delta, acc, step) => textEvents.push({ delta, acc, step }),
+      onReasoningDelta: (delta, acc, step) => reasoningEvents.push({ delta, acc, step }),
+    });
+
+    expect(outerController.signal.aborted).toBe(false);
+    expect(stepSignals[0]?.aborted).toBe(true);
+    expect(stepSignals[1]?.aborted).toBe(false);
+    expect(result.finalState).toBe('done');
+    expect(result.finishReason).toBe('stop');
+    // Default autoWarmSlot0InTurn=false avoids blocking on Slot 0 prefill before Turn 1
+    expect(prefillCalls).toHaveLength(0);
+
+    // Step 0 & Step 1 flags and grounding accumulation
+    expect(requests[0]?.stopOnToolCall).toBe(true);
+    expect(requests[0]?.groundingText).toBe('Seed grounding text');
+    expect(requests[0]?.messages[1]?.id).toBe('ctx1');
+    expect(requests[1]?.stopOnToolCall).toBe(true);
+    expect(requests[1]?.groundingText).toBe('Seed grounding text\n\nObserved tab fact A');
+
+    // Transient buffers cleared before tool execution in step 0
+    const step0ClearTextIdx = textEvents.findIndex((e) => e.step === 0 && e.acc === '');
+    const step0ClearReasoningIdx = reasoningEvents.findIndex((e) => e.step === 0 && e.acc === '');
+    expect(step0ClearTextIdx).toBeGreaterThanOrEqual(0);
+    expect(step0ClearReasoningIdx).toBeGreaterThan(0);
+
+    // rawContent stored on assistantToolMsg & on assistantMsg (when rawStepText !== cleanVisible && !trimmedReasoning)
+    expect(result.newMessages).toHaveLength(3);
+    const asstToolMsg = result.newMessages[0]!;
+    const finalAsstMsg = result.newMessages[2]!;
+    expect(asstToolMsg.content).toBe('');
+    expect(asstToolMsg.rawContent).toBe(
+      '<|channel>thought\nNeed tab\n<channel|><|tool_call>call:read_active_tab{}<tool_call|>',
+    );
+    expect(finalAsstMsg.content).toBe('Final answer with leading space');
+    expect(finalAsstMsg.rawContent).toBe('  Final answer with leading space  ');
+
+    // Live messages preserve rawContent so next turn matches live KV prefix
+    const live = slotCoordinator.getLiveMessages();
+    expect(live[live.length - 1]?.rawContent).toBe('  Final answer with leading space  ');
+    const nextMatch = slotCoordinator.findBestMatch([
+      ...live,
+      { id: 'u2', role: 'user', content: 'Next?', createdAt: 2 },
+    ]);
+    expect(nextMatch.source).toBe('live');
+    expect(nextMatch.matchedMessages).toBe(live.length);
+  });
+
+  it('skips memory.inspect when cachedProfileMemories is supplied and respects waitForMemoryConsolidation', async () => {
+    let inspectCalls = 0;
+    let consolidateResolved = false;
+    let releaseConsolidate: () => void = () => {};
+
+    const memory: MemoryProvider = {
+      async remember(input) {
+        return {
+          id: 'm1',
+          ...input,
+          createdAt: 1,
+          updatedAt: 1,
+          lastAccessedAt: 1,
+          accessCount: 1,
+        };
+      },
+      async recall() {
+        return [];
+      },
+      async consolidate() {
+        await new Promise<void>((resolve) => {
+          releaseConsolidate = () => {
+            consolidateResolved = true;
+            resolve();
+          };
+        });
+        return { added: 1, superseded: 0 };
+      },
+      async inspect() {
+        inspectCalls += 1;
+        return [];
+      },
+      async forget() {
+        return true;
+      },
+      async exportEncrypted() {
+        return new Uint8Array();
+      },
+      async importEncrypted() {
+        return { imported: 0 };
+      },
+      async wipeAll() {},
+    };
+
+    const cached: MemoryRecord[] = [
+      {
+        id: 'prof_1',
+        tier: 'profile',
+        content: 'User prefers concise TypeScript answers',
+        createdAt: 1,
+        updatedAt: 1,
+        lastAccessedAt: 1,
+        accessCount: 1,
+      },
+    ];
+
+    const requests: GenerateRequest[] = [];
+    const adapter = createMockAdapter([
+      async function* (req) {
+        requests.push(req);
+        yield { type: 'text', delta: 'Done.' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+    ]);
+
+    // Default waitForMemoryConsolidation=false returns immediately without blocking on consolidate()
+    const result1 = await runHarnessTurn({
+      sessionId: 'sess_mem',
+      adapter,
+      messages: [{ id: 'u1', role: 'user', content: 'Hi', createdAt: 1 }],
+      memory,
+      cachedProfileMemories: cached,
+    });
+
+    expect(result1.finalState).toBe('done');
+    expect(inspectCalls).toBe(0);
+    expect(consolidateResolved).toBe(false);
+    expect(requests[0]?.messages[0]?.content).toContain('User prefers concise TypeScript answers');
+    releaseConsolidate?.();
+    await new Promise((r) => setTimeout(r, 5));
+
+    // waitForMemoryConsolidation=true awaits consolidate() before resolving
+    consolidateResolved = false;
+    let settled = false;
+    const p2 = runHarnessTurn({
+      sessionId: 'sess_mem_wait',
+      adapter,
+      messages: [{ id: 'u2', role: 'user', content: 'Hi again', createdAt: 2 }],
+      memory,
+      cachedProfileMemories: cached,
+      waitForMemoryConsolidation: true,
+    }).then((res) => {
+      settled = true;
+      return res;
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    releaseConsolidate?.();
+    const result2 = await p2;
+    expect(settled).toBe(true);
+    expect(consolidateResolved).toBe(true);
+    expect(result2.finalState).toBe('done');
+    expect(inspectCalls).toBe(0);
   });
 });

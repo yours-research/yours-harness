@@ -39,7 +39,7 @@ export function estimateMessagesTokens(messages: readonly HarnessMessage[]): num
   let total = 0;
   for (const msg of messages) {
     total += 4; // <|im_start|>role\n ... <|im_end|>\n
-    total += estimateTextTokens(msg.content);
+    total += estimateTextTokens(msg.rawContent ?? msg.content);
     if (msg.toolName) {
       total += estimateTextTokens(msg.toolName) + 2;
     }
@@ -71,7 +71,7 @@ export function estimateToolsTokens(tools?: readonly ToolDefinition[]): number {
  */
 export function hashMessagesPrefix(messages: readonly HarnessMessage[]): string {
   const serialized = messages
-    .map((m) => `${m.role}:${m.toolName ?? ''}:${m.content}`)
+    .map((m) => `${m.role}:${m.toolName ?? ''}:${m.rawContent ?? m.content}`)
     .join('\n\x1e\n');
   return hashStringFnv1a(serialized);
 }

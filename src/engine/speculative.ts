@@ -391,7 +391,12 @@ function messagesMatchPrefix(
   for (let i = 0; i < prefix.length; i += 1) {
     const a = prefix[i]!;
     const b = target[i]!;
-    if (a.role !== b.role || a.content !== b.content || a.toolName !== b.toolName) {
+    if (
+      a.role !== b.role ||
+      a.content !== b.content ||
+      (a.rawContent ?? a.content) !== (b.rawContent ?? b.content) ||
+      a.toolName !== b.toolName
+    ) {
       return false;
     }
   }

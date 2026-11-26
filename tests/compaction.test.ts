@@ -5,6 +5,7 @@ import {
   foldTransientToolResults,
   measureKvPrefixOverlap,
 } from '../src/compaction/index.js';
+import { buildSlot0Envelope as buildSlot0FromRoot } from '../src/index.js';
 import type { HarnessMessage, ToolDefinition } from '../src/contracts.js';
 
 const SAMPLE_TOOLS: ToolDefinition[] = [
@@ -173,5 +174,66 @@ describe('KV-Cache-Preserving Context Compaction', () => {
 
     const overlap = measureKvPrefixOverlap(plan1.compiledMessages, plan2.compiledMessages);
     expect(overlap.preservedMessages).toBe(plan2.kvPrefixPreservedMessages);
+  });
+
+  it('places deduplicated contextMessages immediately after Slot 0 and accounts for their tokens', async () => {
+    expect(buildSlot0FromRoot).toBe(buildSlot0Envelope);
+
+    const compactor = new ContextCompactor({
+      maxContextTokens: 650,
+      reservedOutputTokens: 150,
+      safetyMarginTokens: 50,
+      triggerRatio: 0.85,
+      preserveRecentMessages: 2,
+      summaryMaxTokens: 100,
+    });
+
+    const slot0 = await buildSlot0Envelope({
+      systemPrompt: 'You are Pragma.',
+      tools: SAMPLE_TOOLS,
+    });
+
+    const contextMsg1 = msg('ctx_page', 'system', `Active Page Context: ${'WebGPU pipeline '.repeat(12)}`);
+    const contextMsgDupInHistory = msg('ctx_dup', 'system', 'Duplicate in history');
+    const slot0Dup = msg(slot0.messages[0]!.id, 'system', slot0.messages[0]!.content);
+
+    const history: HarnessMessage[] = [
+      contextMsgDupInHistory,
+      ...Array.from({ length: 6 }, (_, i) => [
+        msg(`u_${i}`, 'user', `Turn ${i}: How does subgroup barrier work in pass ${i}?`),
+        msg(`a_${i}`, 'assistant', `Turn ${i}: Workgroup barriers synchronize invocations cleanly.`),
+      ]).flat(),
+    ];
+
+    const plan1 = await compactor.compact({
+      systemPrompt: 'You are Pragma.',
+      tools: SAMPLE_TOOLS,
+      contextMessages: [slot0Dup, contextMsg1, contextMsg1, contextMsgDupInHistory],
+      messages: history,
+    });
+
+    // Slot 0 remains at index 0, deduped contextMsg1 immediately follows at index 1
+    expect(plan1.compiledMessages[0]?.id).toBe(slot0.messages[0]?.id);
+    expect(plan1.compiledMessages[1]?.id).toBe('ctx_page');
+    // Duplicates (slot0Dup, second contextMsg1, and contextMsgDupInHistory) were filtered out from prefix
+    expect(plan1.compiledMessages.filter((m) => m.id === 'ctx_page')).toHaveLength(1);
+    expect(plan1.compiledMessages.filter((m) => m.id === 'ctx_dup').length).toBeLessThanOrEqual(1);
+    // Compaction enforced total budget including contextMessages
+    expect(plan1.tokensAfter).toBeLessThanOrEqual(650 - 150 - 50);
+
+    // Next turn with unchanged contextMessages preserves both Slot 0 and contextMsg1 in KV prefix
+    const plan2 = await compactor.compact({
+      systemPrompt: 'You are Pragma.',
+      tools: SAMPLE_TOOLS,
+      contextMessages: [contextMsg1],
+      messages: [...history, msg('u_next', 'user', 'Follow-up question')],
+      previousRollingSummary: plan1.rollingSummary,
+      previousRollingSummaryCutoffId: plan1.rollingSummaryCutoffId,
+      previousCompiledMessages: plan1.compiledMessages,
+    });
+
+    expect(plan2.slot0Preserved).toBe(true);
+    expect(plan2.compiledMessages[1]?.id).toBe('ctx_page');
+    expect(plan2.kvPrefixPreservedMessages).toBeGreaterThanOrEqual(3); // Slot 0 + contextMsg1 + rolling summary
   });
 });

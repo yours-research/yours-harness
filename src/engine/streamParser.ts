@@ -25,10 +25,17 @@ export interface StreamParserStepOutput {
   visibleTextReset?: boolean;
 }
 
-const DEFAULT_STOP_SEQUENCES = ['<|im_end|>', '<|endoftext|>', '<end_of_turn>'];
+const DEFAULT_STOP_SEQUENCES = ['<|im_end|>', '<|endoftext|>', '<end_of_turn>', '<turn|>'];
 const PARTIAL_NAME_RE = /["']?name["']?\s*:\s*["']([^"']+)["']/;
-const TOOL_CALL_OPEN_TAG = '<tool_call>';
-const TOOL_CALL_CLOSE_TAG = '</tool_call>';
+const QWEN_XML_NAME_RE = /<function=([^>\s]+)>/;
+const GEMMA4_NAME_RE = /call:([A-Za-z0-9_.-]+)\{/;
+const TOOL_CALL_OPEN_TAGS = ['<tool_call>', '<|tool_call>', '<|call>'] as const;
+const TOOL_CALL_CLOSE_TAG_BY_OPEN: Record<(typeof TOOL_CALL_OPEN_TAGS)[number], string> = {
+  '<tool_call>': '</tool_call>',
+  '<|tool_call>': '<tool_call|>',
+  '<|call>': '<call|>',
+};
+const TOOL_CALL_CLOSE_TAGS = ['</tool_call>', '<tool_call|>', '<call|>'] as const;
 const THINK_OPEN_TAGS = ['<think>', '<thought>', '<|channel>thought\n', '<|channel>thought', '<|thought|>'];
 const THINK_CLOSE_TAGS = ['</think>', '</thought>', '<channel|>', '<|/thought|>', '<|end_of_thought|>'];
 
@@ -137,13 +144,209 @@ export function parseLenientJsonObject(rawInput: string): Record<string, unknown
   return tryParse(closed);
 }
 
+function detectPendingToolName(payload: string): string | null {
+  return (
+    PARTIAL_NAME_RE.exec(payload)?.[1] ??
+    QWEN_XML_NAME_RE.exec(payload)?.[1] ??
+    GEMMA4_NAME_RE.exec(payload)?.[1] ??
+    null
+  );
+}
+
+function hasToolCallMarkup(payload: string): boolean {
+  return (
+    payload.includes('<function=') ||
+    payload.includes('"name"') ||
+    /["']?name["']?\s*:/.test(payload) ||
+    payload.includes('call:')
+  );
+}
+
+function parseXmlParameterValue(rawValue: string): unknown {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (
+    trimmed === 'true' ||
+    trimmed === 'false' ||
+    trimmed.startsWith('{') ||
+    trimmed.startsWith('[') ||
+    /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(trimmed)
+  ) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (
+        typeof parsed === 'number' ||
+        typeof parsed === 'boolean' ||
+        (parsed !== null && typeof parsed === 'object')
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Keep original trimmed string when value is not valid JSON
+    }
+  }
+  return trimmed;
+}
+
+function convertGemma4ArgsToJson(rawObject: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  let escaped = false;
+  const containerStack: Array<'{' | '['> = [];
+  let expectKey = false;
+
+  while (i < rawObject.length) {
+    const ch = rawObject[i]!;
+
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (rawObject.startsWith('<|"|>', i)) {
+      const endIdx = rawObject.indexOf('<|"|>', i + 5);
+      const inner = endIdx === -1 ? rawObject.slice(i + 5) : rawObject.slice(i + 5, endIdx);
+      out += JSON.stringify(inner);
+      i = endIdx === -1 ? rawObject.length : endIdx + 5;
+      expectKey = false;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      expectKey = false;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '{') {
+      containerStack.push('{');
+      expectKey = true;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '[') {
+      containerStack.push('[');
+      expectKey = false;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '}' || ch === ']') {
+      containerStack.pop();
+      expectKey = false;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === ',') {
+      expectKey = containerStack[containerStack.length - 1] === '{';
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === ':') {
+      expectKey = false;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (expectKey) {
+      const keyMatch = /^([A-Za-z_][A-Za-z0-9_.-]*)(\s*:)/.exec(rawObject.slice(i));
+      if (keyMatch) {
+        out += `${JSON.stringify(keyMatch[1])}${keyMatch[2]}`;
+        i += keyMatch[0].length;
+        expectKey = false;
+        continue;
+      }
+    }
+
+    expectKey = false;
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
 /**
- * Extracts a tool call from a raw payload (inside <tool_call> or JSON block).
+ * Extracts a tool call from a raw payload (JSON, Qwen3.5 XML, or Gemma 4 native syntax).
  */
 export function extractToolCallFromPayload(
   payload: string,
   id: string,
 ): ParsedToolCall | null {
+  // 1. Qwen3.5 XML: <function=tool_name><parameter=key>value</parameter>...</function>
+  const qwenXmlMatch = /^\s*<function=([^>\s]+)>([\s\S]*?)(?:<\/function>|$)/.exec(payload);
+  if (qwenXmlMatch) {
+    const funcName = qwenXmlMatch[1]!.trim();
+    if (!funcName) {
+      return null;
+    }
+    const body = qwenXmlMatch[2] ?? '';
+    const args: Record<string, unknown> = {};
+    const paramRe = /<parameter=([^>\s]+)>([\s\S]*?)(?:<\/parameter>|(?=<parameter=)|$)/g;
+    let paramMatch: RegExpExecArray | null;
+    while ((paramMatch = paramRe.exec(body)) !== null) {
+      const key = paramMatch[1]!.trim();
+      if (!key) {
+        continue;
+      }
+      args[key] = parseXmlParameterValue(paramMatch[2] ?? '');
+    }
+    return {
+      id,
+      name: funcName,
+      arguments: args,
+      raw: payload,
+    };
+  }
+
+  // 2. Gemma 4 native: call:tool_name{key:<|"|>value<|"|>,num:42}
+  const gemma4Match = /^\s*call:([A-Za-z0-9_.-]+)\s*(\{[\s\S]*)$/.exec(payload);
+  if (gemma4Match) {
+    const funcName = gemma4Match[1]!.trim();
+    if (!funcName) {
+      return null;
+    }
+    const jsonArgs = convertGemma4ArgsToJson(gemma4Match[2]!);
+    const parsedArgs = parseLenientJsonObject(jsonArgs);
+    if (!parsedArgs) {
+      return null;
+    }
+    return {
+      id,
+      name: funcName,
+      arguments: parsedArgs,
+      raw: payload,
+    };
+  }
+
+  // 3. JSON tool-call object
   const parsed = parseLenientJsonObject(payload);
   if (!parsed) {
     return null;
@@ -214,7 +417,7 @@ function emptyStepOutput(): StreamParserStepOutput {
 /**
  * Incremental streaming parser tolerant of small local LLM quirks:
  * - Interleaved, pre-opened, or unclosed `<think>` / `<thought>` / `<|channel>thought` / `<|thought|>` reasoning blocks
- * - XML `<tool_call>...</tool_call>` blocks
+ * - JSON / Qwen3.5 XML (`<tool_call>...</tool_call>`) and Gemma 4 (`<|tool_call>call:...<tool_call|>`, `<|call>call:...<call|>`) tool-call blocks
  * - Malformed/partial JSON inside tool calls
  * - Bare JSON or fenced JSON tool calls on flush
  * - Stop-sequence guards (prevents stop tokens leaking into UI text)
@@ -228,6 +431,8 @@ export class StreamOutputParser {
   private mode: 'text' | 'think' | 'tool_call' = 'text';
   private buffer = '';
   private pendingToolPayload = '';
+  private activeToolCallOpenTag = '<tool_call>';
+  private activeToolCallCloseTag = '</tool_call>';
   private pendingPostThinkNewlineTrim = false;
   private toolCallCounter = 0;
   private lastPendingToolName: string | null = null;
@@ -323,7 +528,7 @@ export class StreamOutputParser {
         const candidateTags = [
           ...THINK_OPEN_TAGS,
           ...THINK_CLOSE_TAGS,
-          TOOL_CALL_OPEN_TAG,
+          ...TOOL_CALL_OPEN_TAGS,
         ];
         const tagMatch = findEarliestIndex(this.buffer, candidateTags);
 
@@ -356,8 +561,11 @@ export class StreamOutputParser {
 
           emitText(this.buffer.slice(0, tagMatch.index));
           this.buffer = this.buffer.slice(tagMatch.index + tagMatch.tag.length);
-          if (tagMatch.tag === TOOL_CALL_OPEN_TAG) {
+          if ((TOOL_CALL_OPEN_TAGS as readonly string[]).includes(tagMatch.tag)) {
+            const openTag = tagMatch.tag as (typeof TOOL_CALL_OPEN_TAGS)[number];
             this.mode = 'tool_call';
+            this.activeToolCallOpenTag = openTag;
+            this.activeToolCallCloseTag = TOOL_CALL_CLOSE_TAG_BY_OPEN[openTag];
             this.pendingToolPayload = '';
             this.lastPendingToolName = null;
           } else {
@@ -375,7 +583,8 @@ export class StreamOutputParser {
         const holdLen = trailingPartialPrefixLength(this.buffer, [
           ...THINK_OPEN_TAGS,
           ...THINK_CLOSE_TAGS,
-          TOOL_CALL_OPEN_TAG,
+          ...TOOL_CALL_OPEN_TAGS,
+          ...TOOL_CALL_CLOSE_TAGS,
           ...this.stopSequences,
         ]);
         const safeLen = this.buffer.length - holdLen;
@@ -418,10 +627,12 @@ export class StreamOutputParser {
       }
 
       if (this.mode === 'tool_call') {
-        const closeIdx = this.buffer.indexOf(TOOL_CALL_CLOSE_TAG);
+        const closeIdx = this.buffer.indexOf(this.activeToolCallCloseTag);
         if (closeIdx !== -1) {
+          const matchedOpenTag = this.activeToolCallOpenTag;
+          const matchedCloseTag = this.activeToolCallCloseTag;
           this.pendingToolPayload += this.buffer.slice(0, closeIdx);
-          this.buffer = this.buffer.slice(closeIdx + TOOL_CALL_CLOSE_TAG.length);
+          this.buffer = this.buffer.slice(closeIdx + matchedCloseTag.length);
 
           this.toolCallCounter += 1;
           const id = this.makeToolCallId(this.toolCallCounter);
@@ -430,8 +641,11 @@ export class StreamOutputParser {
             this.parsedToolCalls.push(parsed);
             toolCallsReady.push(parsed);
           } else {
-            // Unrecoverable malformed payload: surface raw text so nothing vanishes silently
-            emitText(`${TOOL_CALL_OPEN_TAG}${this.pendingToolPayload}${TOOL_CALL_CLOSE_TAG}`);
+            this.toolCallCounter -= 1;
+            if (!hasToolCallMarkup(this.pendingToolPayload)) {
+              // Unrecoverable non-markup payload: surface raw text so prose does not vanish
+              emitText(`${matchedOpenTag}${this.pendingToolPayload}${matchedCloseTag}`);
+            }
           }
           this.pendingToolPayload = '';
           this.lastPendingToolName = null;
@@ -440,7 +654,7 @@ export class StreamOutputParser {
           if (this.stopOnToolCall && parsed) {
             this.stopped = true;
             this.buffer = '';
-            stopSequenceHit = TOOL_CALL_CLOSE_TAG;
+            stopSequenceHit = matchedCloseTag;
             break;
           }
           continue;
@@ -456,7 +670,10 @@ export class StreamOutputParser {
             this.parsedToolCalls.push(parsed);
             toolCallsReady.push(parsed);
           } else {
-            emitText(`${TOOL_CALL_OPEN_TAG}${this.pendingToolPayload}`);
+            this.toolCallCounter -= 1;
+            if (!hasToolCallMarkup(this.pendingToolPayload)) {
+              emitText(`${this.activeToolCallOpenTag}${this.pendingToolPayload}`);
+            }
           }
           this.pendingToolPayload = '';
           this.lastPendingToolName = null;
@@ -464,14 +681,16 @@ export class StreamOutputParser {
           break;
         }
 
-        const holdLen = trailingPartialPrefixLength(this.buffer, [TOOL_CALL_CLOSE_TAG]);
+        const holdLen = trailingPartialPrefixLength(this.buffer, [
+          this.activeToolCallCloseTag,
+          ...TOOL_CALL_CLOSE_TAGS,
+        ]);
         const safeLen = this.buffer.length - holdLen;
         if (safeLen > 0) {
           this.pendingToolPayload += this.buffer.slice(0, safeLen);
           this.buffer = this.buffer.slice(safeLen);
         }
-        const nameMatch = PARTIAL_NAME_RE.exec(this.pendingToolPayload);
-        const detectedName = nameMatch?.[1] ?? 'tool';
+        const detectedName = detectPendingToolName(this.pendingToolPayload) ?? 'tool';
         if (detectedName !== this.lastPendingToolName) {
           this.lastPendingToolName = detectedName;
           pendingToolCall = { name: detectedName };
@@ -492,7 +711,8 @@ export class StreamOutputParser {
         this.parsedToolCalls.push(recovered.call);
         toolCallsReady.push(recovered.call);
         this.fullVisibleText = recovered.cleanText;
-        textOut = '';
+        textOut = recovered.cleanText;
+        visibleTextReset = true;
       }
     }
 
