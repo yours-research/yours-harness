@@ -272,4 +272,35 @@ describe('KV-Cache-Preserving Context Compaction', () => {
     expect(plan.rollingSummary).toContain('94107');
     expect(plan.tokensAfter).toBeLessThanOrEqual(312);
   });
+
+  it('preserves high-salience buried identifiers when folding bulky spotlighted tool outputs', () => {
+    const bulkyPayload = [
+      '[BEGIN UNTRUSTED CONTENT id="ug-991a" origin="https://example.org" tainted="true" risk="0.00"]',
+      '[ARTICLE] Cloud Infrastructure Overview',
+      'URL: https://example.org/docs/cluster-guide',
+      ...Array.from({ length: 14 }, (_, i) => `Introductory boilerplate paragraph ${i + 1} describing general cloud networking concepts.`),
+      'Critical specification: Cluster code BUDGET-CAP-991 with SLA $7,250 and port 8443.',
+      '[END UNTRUSTED CONTENT id="ug-991a"]',
+    ].join('\n');
+
+    const messages: HarnessMessage[] = [
+      msg('u1', 'user', 'Read the cluster guide page'),
+      msg('t1', 'tool', bulkyPayload, { toolName: 'read_tab', tainted: true }),
+      msg('a1', 'assistant', 'Noted the cluster guide specification.'),
+      msg('u2', 'user', 'Follow-up turn'),
+    ];
+
+    const folded = foldTransientToolResults(messages, {
+      preserveRecentTurns: 1,
+      foldThresholdChars: 360,
+    });
+
+    expect(folded.foldedCount).toBe(1);
+    const citation = folded.messages[1]?.content ?? '';
+    expect(citation).toContain('[Folded read_tab output');
+    expect(citation).not.toContain('Summary: [BEGIN UNTRUSTED');
+    expect(citation).toContain('BUDGET-CAP-991');
+    expect(citation).toContain('8443');
+    expect(folded.messages[1]?.tainted).toBe(true);
+  });
 });
