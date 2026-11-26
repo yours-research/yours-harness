@@ -144,14 +144,20 @@ export interface RunHarnessTurnParams {
   environment?: ToolInvocationContext['environment'];
   adapter: RuntimeAdapter;
   messages: readonly HarnessMessage[];
+  contextMessages?: readonly HarnessMessage[];
+  groundingText?: string;
   systemPrompt?: string;
   tools?: readonly ToolDefinition[];
   toolExecutor?: ToolExecutor;
   guard?: GuardEngine;
   memory?: MemoryProvider;
+  cachedProfileMemories?: readonly MemoryRecord[];
   compactor?: ContextCompactor;
   compactionConfig?: Partial<CompactionBudgetConfig>;
   slotCoordinator?: PrefixSlotCoordinator;
+  autoWarmSlot0InTurn?: boolean;
+  stopOnToolCall?: boolean;
+  waitForMemoryConsolidation?: boolean;
   activeOrigin?: string;
   explicitlyApprovedOrigins?: string[];
   maxToolSteps?: number;
@@ -250,10 +256,15 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
     });
 
   const tools = params.tools ?? params.toolExecutor?.listTools?.() ?? [];
-  let profileMemories: MemoryRecord[] = [];
-  if (params.memory) {
+  let profileMemories: readonly MemoryRecord[] = params.cachedProfileMemories ?? [];
+  if (!params.cachedProfileMemories && params.memory) {
     profileMemories = await params.memory.inspect({ tier: 'profile', limit: 16 }).catch(() => []);
   }
+
+  const autoWarmSlot0InTurn = params.autoWarmSlot0InTurn ?? false;
+  const stopOnToolCall = params.stopOnToolCall ?? Boolean(params.toolExecutor && tools.length > 0);
+  const waitForMemoryConsolidation = params.waitForMemoryConsolidation ?? false;
+  let stepGroundingText = params.groundingText ?? '';
 
   const history: HarnessMessage[] = params.messages.map((m) => ({ ...m }));
   const newMessages: HarnessMessage[] = [];
@@ -310,6 +321,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         systemPrompt: params.systemPrompt,
         tools,
         profileMemories,
+        contextMessages: params.contextMessages,
         messages: history,
         previousRollingSummary: rollingSummary,
         previousRollingSummaryCutoffId: rollingSummaryCutoffId,
@@ -333,7 +345,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         const match = params.slotCoordinator.findBestMatch(plan.compiledMessages);
         if (match.source === 'slot' && match.slotKey) {
           prefixSlotKey = match.slotKey;
-        } else if (match.source === 'none') {
+        } else if (match.source === 'none' && autoWarmSlot0InTurn) {
           fsm.transition('prefilling', 'slot0-warmup');
           await params.slotCoordinator
             .prefillSlot(plan.slot0.slotKey, plan.slot0.messages, {
@@ -352,14 +364,28 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
       fsm.transition('streaming', `step-${step}`);
       const parser = new StreamOutputParser({
         stopSequences: params.stopSequences,
-        stopOnToolCall: false,
+        stopOnToolCall,
       });
 
       const nativeToolCalls: ParsedToolCall[] = [];
       const pendingNativeTools = new Map<string, { id: string; name: string; args: string }>();
       let stepAccumulatedText = '';
       let stepAccumulatedReasoning = '';
+      let rawStepText = '';
       let adapterFinishReason: 'stop' | 'length' | 'tool_calls' | 'abort' = 'stop';
+      let stepStoppedForToolCall = false;
+
+      const stepAbortController = new AbortController();
+      const abortStep = () => {
+        if (!stepAbortController.signal.aborted) {
+          stepAbortController.abort();
+        }
+      };
+      if (localController.signal.aborted) {
+        abortStep();
+      } else {
+        localController.signal.addEventListener('abort', abortStep, { once: true });
+      }
 
       const applyParserStep = (parsed: StreamParserStepOutput) => {
         if (parsed.visibleTextReset) {
@@ -384,78 +410,105 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         }
       };
 
-      for await (const delta of params.adapter.generate(
-        {
-          messages: plan.compiledMessages,
-          tools: tools.length > 0 ? [...tools] : undefined,
-          maxNewTokens: params.maxNewTokens,
-          temperature: params.temperature,
-          topP: params.topP,
-          topK: params.topK,
-          enableThinking: params.enableThinking,
-          pacingMode: params.pacingMode,
-          prefixSlotKey,
-        },
-        localController.signal,
-      )) {
-        if (localController.signal.aborted) {
-          adapterFinishReason = 'abort';
-          break;
-        }
+      try {
+        for await (const delta of params.adapter.generate(
+          {
+            messages: plan.compiledMessages,
+            tools: tools.length > 0 ? [...tools] : undefined,
+            maxNewTokens: params.maxNewTokens,
+            temperature: params.temperature,
+            topP: params.topP,
+            topK: params.topK,
+            enableThinking: params.enableThinking,
+            pacingMode: params.pacingMode,
+            prefixSlotKey,
+            stopOnToolCall,
+            groundingText: stepGroundingText || undefined,
+          },
+          stepAbortController.signal,
+        )) {
+          if (localController.signal.aborted) {
+            adapterFinishReason = 'abort';
+            break;
+          }
 
-        switch (delta.type) {
-          case 'text': {
-            applyParserStep(parser.pushText(delta.delta));
-            break;
-          }
-          case 'reasoning': {
-            stepAccumulatedReasoning += delta.delta;
-            reasoningText += delta.delta;
-            params.onReasoningDelta?.(delta.delta, stepAccumulatedReasoning, step);
-            break;
-          }
-          case 'tool_call_start': {
-            pendingNativeTools.set(delta.id, { id: delta.id, name: delta.name, args: '' });
-            params.onToolCallStart?.({ step, id: delta.id, name: delta.name });
-            break;
-          }
-          case 'tool_call_args': {
-            const entry = pendingNativeTools.get(delta.id);
-            if (entry) {
-              entry.args += delta.delta;
+          switch (delta.type) {
+            case 'text': {
+              rawStepText += delta.delta;
+              const parsed = parser.pushText(delta.delta);
+              applyParserStep(parsed);
+              if (stopOnToolCall && parsed.stopSequenceHit && parser.getToolCalls().length > 0) {
+                stepStoppedForToolCall = true;
+                const hitIdx = rawStepText.lastIndexOf(parsed.stopSequenceHit);
+                if (hitIdx !== -1) {
+                  rawStepText = rawStepText.slice(0, hitIdx + parsed.stopSequenceHit.length);
+                }
+                abortStep();
+              }
+              break;
             }
-            break;
-          }
-          case 'tool_call_ready': {
-            pendingNativeTools.delete(delta.id);
-            nativeToolCalls.push({
-              id: delta.id,
-              name: delta.name,
-              arguments: delta.arguments,
-              raw: JSON.stringify(delta.arguments),
-            });
-            break;
-          }
-          case 'telemetry': {
-            if (delta.ttftMs !== undefined) telemetry.ttftMs = delta.ttftMs;
-            if (delta.tokensPerSec !== undefined) telemetry.tokensPerSec = delta.tokensPerSec;
-            if (delta.kvTokens !== undefined) telemetry.kvTokens = delta.kvTokens;
-            if (delta.speculativeAcceptRate !== undefined) {
-              telemetry.speculativeAcceptRate = delta.speculativeAcceptRate;
+            case 'reasoning': {
+              stepAccumulatedReasoning += delta.delta;
+              reasoningText += delta.delta;
+              params.onReasoningDelta?.(delta.delta, stepAccumulatedReasoning, step);
+              break;
             }
-            params.onTelemetry?.({ ...telemetry, totalDurationMs: performance.now() - turnStartMs });
-            break;
+            case 'tool_call_start': {
+              pendingNativeTools.set(delta.id, { id: delta.id, name: delta.name, args: '' });
+              params.onToolCallStart?.({ step, id: delta.id, name: delta.name });
+              break;
+            }
+            case 'tool_call_args': {
+              const entry = pendingNativeTools.get(delta.id);
+              if (entry) {
+                entry.args += delta.delta;
+              }
+              break;
+            }
+            case 'tool_call_ready': {
+              pendingNativeTools.delete(delta.id);
+              nativeToolCalls.push({
+                id: delta.id,
+                name: delta.name,
+                arguments: delta.arguments,
+                raw: JSON.stringify(delta.arguments),
+              });
+              break;
+            }
+            case 'telemetry': {
+              if (delta.ttftMs !== undefined) telemetry.ttftMs = delta.ttftMs;
+              if (delta.tokensPerSec !== undefined) telemetry.tokensPerSec = delta.tokensPerSec;
+              if (delta.kvTokens !== undefined) telemetry.kvTokens = delta.kvTokens;
+              if (delta.speculativeAcceptRate !== undefined) {
+                telemetry.speculativeAcceptRate = delta.speculativeAcceptRate;
+              }
+              params.onTelemetry?.({ ...telemetry, totalDurationMs: performance.now() - turnStartMs });
+              break;
+            }
+            case 'done': {
+              adapterFinishReason = delta.finishReason;
+              break;
+            }
           }
-          case 'done': {
-            adapterFinishReason = delta.finishReason;
+
+          if (stepStoppedForToolCall) {
             break;
           }
         }
+      } catch (err) {
+        if (!stepStoppedForToolCall) {
+          throw err;
+        }
+      } finally {
+        localController.signal.removeEventListener('abort', abortStep);
       }
 
       applyParserStep(parser.flush());
 
-      if (localController.signal.aborted || adapterFinishReason === 'abort') {
+      if (
+        localController.signal.aborted ||
+        (adapterFinishReason === 'abort' && !stepStoppedForToolCall)
+      ) {
         finishReason = 'abort';
         break;
       }
@@ -465,20 +518,6 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
       const cleanVisible = parser.getVisibleText().trim() || stepAccumulatedText.trim();
       const trimmedReasoning = stepAccumulatedReasoning.trim();
 
-      params.slotCoordinator?.setLiveMessages([
-        ...plan.compiledMessages,
-        ...(cleanVisible
-          ? [
-              {
-                id: createId('live_asst'),
-                role: 'assistant' as const,
-                content: cleanVisible,
-                createdAt: Date.now(),
-              },
-            ]
-          : []),
-      ]);
-
       // No tool calls or reached maxToolSteps -> finalize assistant answer
       if (allToolCalls.length === 0 || !params.toolExecutor || step >= maxToolSteps) {
         finalText = cleanVisible;
@@ -486,9 +525,11 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
           id: createId('msg'),
           role: 'assistant',
           content: cleanVisible,
+          ...(rawStepText !== cleanVisible && !trimmedReasoning ? { rawContent: rawStepText } : {}),
           ...(trimmedReasoning ? { reasoning: trimmedReasoning } : {}),
           createdAt: Date.now(),
         };
+        params.slotCoordinator?.setLiveMessages([...plan.compiledMessages, assistantMsg]);
         history.push(assistantMsg);
         newMessages.push(assistantMsg);
         finishReason =
@@ -501,22 +542,29 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         break;
       }
 
+      // Clear transient streaming buffers before executing tools
+      params.onTextDelta?.('', '', step);
+      params.onReasoningDelta?.('', '', step);
+
       // Execute tool calls in this step
       const firstCall = allToolCalls[0]!;
       const assistantToolMsg: HarnessMessage = {
         id: createId('msg'),
         role: 'assistant',
         content: cleanVisible,
+        rawContent: rawStepText,
         ...(trimmedReasoning ? { reasoning: trimmedReasoning } : {}),
         toolName: firstCall.name,
         toolCallId: firstCall.id,
         toolArgs: firstCall.arguments,
         createdAt: Date.now(),
       };
+      params.slotCoordinator?.setLiveMessages([...plan.compiledMessages, assistantToolMsg]);
       history.push(assistantToolMsg);
       newMessages.push(assistantToolMsg);
 
       let deniedByUserOrGuard = false;
+      const stepToolOutputs: string[] = [];
 
       for (const call of allToolCalls) {
         if (localController.signal.aborted) {
@@ -690,11 +738,21 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         };
         history.push(toolMsg);
         newMessages.push(toolMsg);
+        if (formattedContent.trim()) {
+          stepToolOutputs.push(formattedContent.trim());
+        }
       }
 
       if (localController.signal.aborted) {
         finishReason = 'abort';
         break;
+      }
+
+      if (stepToolOutputs.length > 0) {
+        const joinedOutputs = stepToolOutputs.join('\n\n');
+        stepGroundingText = stepGroundingText
+          ? `${stepGroundingText}\n\n${joinedOutputs}`
+          : joinedOutputs;
       }
 
       if (deniedByUserOrGuard && step === maxToolSteps) {
@@ -712,7 +770,11 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
     }
 
     if (params.memory && fsm.state === 'done' && newMessages.length > 0) {
-      await params.memory.consolidate(params.sessionId, newMessages).catch(() => {});
+      if (waitForMemoryConsolidation) {
+        await params.memory.consolidate(params.sessionId, newMessages).catch(() => {});
+      } else {
+        void params.memory.consolidate(params.sessionId, newMessages).catch(() => {});
+      }
     }
 
     const endMs = performance.now();

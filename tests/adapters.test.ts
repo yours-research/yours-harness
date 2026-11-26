@@ -218,4 +218,86 @@ describe('Pluggable Runtime Adapters & Registry', () => {
         .join(''),
     ).toBe('MLC Ready');
   });
+
+  it('forwards rawContent, isDraft, stopOnToolCall, and groundingText in WgslWorkerAdapter', async () => {
+    const listeners = new Set<(msg: unknown) => void>();
+    const posted: Array<Record<string, unknown>> = [];
+
+    const transport: WorkerPortTransport = {
+      postMessage(raw) {
+        const msg = raw as Record<string, unknown>;
+        posted.push(msg);
+        queueMicrotask(() => {
+          if (msg.type === 'PREFILL_BACKGROUND') {
+            listeners.forEach((fn) =>
+              fn({
+                type: 'PREFILL_COMPLETE',
+                requestId: msg.requestId,
+                slotKey: msg.slotKey,
+                tokens: 64,
+                elapsedMs: 4,
+              }),
+            );
+          } else if (msg.type === 'GENERATE') {
+            listeners.forEach((fn) =>
+              fn({ type: 'GENERATION_COMPLETE', requestId: msg.requestId, finishReason: 'stop' }),
+            );
+          }
+        });
+      },
+      addMessageListener(fn) {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      },
+    };
+
+    const adapter = new WgslWorkerAdapter({ transport });
+    const rawMsgs: HarnessMessage[] = [
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: 'Clean UI text',
+        rawContent: '<tool_call>{"name":"read_active_tab","arguments":{}}</tool_call>',
+        toolName: 'read_active_tab',
+        toolCallId: 'tc_1',
+        createdAt: 1,
+      },
+    ];
+
+    await adapter.prefillSlot('draft:composer', rawMsgs);
+    await adapter.prefillSlot('base-system:123', rawMsgs);
+
+    const draftPost = posted.find((p) => p.type === 'PREFILL_BACKGROUND' && p.slotKey === 'draft:composer');
+    const basePost = posted.find((p) => p.type === 'PREFILL_BACKGROUND' && p.slotKey === 'base-system:123');
+    expect(draftPost?.isDraft).toBe(true);
+    expect(basePost?.isDraft).toBe(false);
+    expect((draftPost?.messages as Array<{ content: string }>)[0]?.content).toBe(
+      '<tool_call>{"name":"read_active_tab","arguments":{}}</tool_call>',
+    );
+
+    await collectDeltas(
+      adapter.generate({
+        messages: rawMsgs,
+        stopOnToolCall: true,
+        groundingText: 'Grounding facts here',
+      }),
+    );
+
+    await collectDeltas(
+      adapter.generate({
+        messages: [{ id: 'u2', role: 'user', content: 'Plain user text', createdAt: 2 }],
+      }),
+    );
+
+    const genWithFlags = posted.filter((p) => p.type === 'GENERATE')[0]!;
+    const genPlain = posted.filter((p) => p.type === 'GENERATE')[1]!;
+    expect((genWithFlags.messages as Array<{ content: string }>)[0]?.content).toBe(
+      '<tool_call>{"name":"read_active_tab","arguments":{}}</tool_call>',
+    );
+    expect(genWithFlags.stopOnToolCall).toBe(true);
+    expect(genWithFlags.groundingText).toBe('Grounding facts here');
+
+    expect('stopOnToolCall' in genPlain).toBe(false);
+    expect('groundingText' in genPlain).toBe(false);
+  });
 });

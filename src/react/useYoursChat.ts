@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
+import type { HarnessMessage } from '../contracts.js';
 import {
   ChatSession,
   type ChatSessionOptions,
@@ -23,6 +24,8 @@ export interface UseYoursChatResult extends ChatSessionSnapshot {
       explicitlyApprovedOrigins?: string[];
       titleIfFirst?: string;
       enableThinking?: boolean;
+      contextMessages?: readonly HarnessMessage[];
+      groundingText?: string;
     },
   ) => Promise<void>;
   updateOptions: (patch: ChatSessionUpdateOptions) => void;
@@ -77,6 +80,8 @@ export function useYoursChat(options: UseYoursChatOptions): UseYoursChatResult {
       topP: options.topP,
       topK: options.topK,
       systemPrompt: options.systemPrompt,
+      tools: options.tools,
+      contextMessages: options.contextMessages,
     });
   }, [
     session,
@@ -87,6 +92,8 @@ export function useYoursChat(options: UseYoursChatOptions): UseYoursChatResult {
     options.topP,
     options.topK,
     options.systemPrompt,
+    options.tools,
+    options.contextMessages,
   ]);
 
   useEffect(() => {
@@ -114,6 +121,8 @@ export function useYoursChat(options: UseYoursChatOptions): UseYoursChatResult {
         explicitlyApprovedOrigins?: string[];
         titleIfFirst?: string;
         enableThinking?: boolean;
+        contextMessages?: readonly HarnessMessage[];
+        groundingText?: string;
       },
     ) => session.sendMessage(content, sendOptions),
     [session],

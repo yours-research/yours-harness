@@ -1,9 +1,11 @@
 import { ContextCompactor, type CompactionBudgetConfig, type CompactionPlan } from '../compaction/compactor.js';
+import { buildSlot0Envelope } from '../compaction/slot0.js';
 import type {
   GpuPacingMode,
   GuardEngine,
   HarnessMessage,
   MemoryProvider,
+  MemoryRecord,
   RuntimeAdapter,
   ToolDefinition,
   ToolExecutor,
@@ -21,12 +23,13 @@ import {
   type TurnTelemetrySnapshot,
 } from '../engine/turnStateMachine.js';
 import { InMemoryStore } from '../storage/inMemoryStore.js';
-import type {
-  BranchSiblingInfo,
-  HarnessStore,
-  MessageNode,
-  ThreadRecord,
-  ThreadSearchHit,
+import {
+  buildActivePathFromMap,
+  type BranchSiblingInfo,
+  type HarnessStore,
+  type MessageNode,
+  type ThreadRecord,
+  type ThreadSearchHit,
 } from '../storage/types.js';
 import { createId } from '../utils/id.js';
 import { estimateMessagesTokens } from '../utils/tokens.js';
@@ -36,6 +39,7 @@ export interface ChatSessionOptions {
   store?: HarnessStore;
   threadId?: string;
   systemPrompt?: string;
+  contextMessages?: readonly HarnessMessage[];
   environment?: ToolInvocationContext['environment'];
   tools?: readonly ToolDefinition[];
   toolExecutor?: ToolExecutor;
@@ -64,6 +68,8 @@ export type ChatSessionUpdateOptions = Partial<
     | 'topP'
     | 'topK'
     | 'systemPrompt'
+    | 'tools'
+    | 'contextMessages'
   >
 >;
 
@@ -102,7 +108,8 @@ export class ChatSession {
   private readonly store: HarnessStore;
   private readonly environment: ToolInvocationContext['environment'];
   private defaultSystemPrompt?: string;
-  private readonly tools?: readonly ToolDefinition[];
+  private tools?: readonly ToolDefinition[];
+  private contextMessages?: readonly HarnessMessage[];
   private readonly toolExecutor?: ToolExecutor;
   private readonly guard?: GuardEngine;
   private readonly memory?: MemoryProvider;
@@ -126,6 +133,10 @@ export class ChatSession {
   private approvalResolver: ((approved: boolean) => void) | null = null;
   private previousCompiledMessages: HarnessMessage[] | undefined;
   private pendingThreadSystemPrompt?: { threadId: string; systemPrompt: string | undefined };
+  private cachedProfileMemories: MemoryRecord[] | undefined;
+  private pendingStreamingText: string | undefined;
+  private pendingStreamingReasoning: string | undefined;
+  private streamRafId: number | null = null;
 
   private snapshot: ChatSessionSnapshot = {
     thread: null,
@@ -149,6 +160,7 @@ export class ChatSession {
     this.environment = options.environment ?? 'web-demo';
     this.defaultSystemPrompt = options.systemPrompt;
     this.tools = options.tools;
+    this.contextMessages = options.contextMessages;
     this.toolExecutor = options.toolExecutor;
     this.guard = options.guard;
     this.memory = options.memory;
@@ -181,7 +193,34 @@ export class ChatSession {
             ],
             isEngineIdle: () => !isActiveTurnState(this.snapshot.state),
             onPrefill: async (slotKey, messages, signal) => {
-              await this.slotCoordinator.prefillSlot(slotKey, messages, {
+              const slot0 = await buildSlot0Envelope({
+                systemPrompt: this.snapshot.thread?.systemPrompt ?? this.defaultSystemPrompt,
+                tools: this.tools,
+                profileMemories: this.cachedProfileMemories ?? [],
+              });
+              if (signal.aborted) {
+                return;
+              }
+              const excludedIds = new Set([
+                ...slot0.messages.map((m) => m.id),
+                ...messages.map((m) => m.id),
+              ]);
+              const excludedSigs = new Set([
+                ...slot0.messages.map((m) => `${m.role}\x00${m.toolName ?? ''}\x00${m.content}`),
+                ...messages.map((m) => `${m.role}\x00${m.toolName ?? ''}\x00${m.content}`),
+              ]);
+              const filteredContext = (this.contextMessages ?? []).filter(
+                (m) =>
+                  !m.id.startsWith('slot0_') &&
+                  !excludedIds.has(m.id) &&
+                  !excludedSigs.has(`${m.role}\x00${m.toolName ?? ''}\x00${m.content}`),
+              );
+              const fullPrefixMessages: HarnessMessage[] = [
+                ...slot0.messages,
+                ...filteredContext,
+                ...messages,
+              ];
+              await this.slotCoordinator.prefillSlot(slotKey, fullPrefixMessages, {
                 kind: 'draft',
                 signal,
               });
@@ -190,7 +229,9 @@ export class ChatSession {
         : null;
 
     this.fsm.subscribe((transition) => {
+      const streamPatch = this.consumePendingStreamingPatch();
       this.patchSnapshot({
+        ...streamPatch,
         state: transition.to,
         isGenerating: isActiveTurnState(transition.to),
       });
@@ -215,6 +256,8 @@ export class ChatSession {
     if ('temperature' in patch) this.temperature = patch.temperature;
     if ('topP' in patch) this.topP = patch.topP;
     if ('topK' in patch) this.topK = patch.topK;
+    if ('tools' in patch) this.tools = patch.tools;
+    if ('contextMessages' in patch) this.contextMessages = patch.contextMessages;
     if ('systemPrompt' in patch) {
       const prevDefault = this.defaultSystemPrompt;
       this.defaultSystemPrompt = patch.systemPrompt;
@@ -238,6 +281,16 @@ export class ChatSession {
     }
   }
 
+  async refreshProfileMemories(): Promise<MemoryRecord[]> {
+    if (!this.memory) {
+      this.cachedProfileMemories = [];
+      return [];
+    }
+    const memories = await this.memory.inspect({ tier: 'profile', limit: 16 }).catch(() => []);
+    this.cachedProfileMemories = memories;
+    return memories;
+  }
+
   async init(threadId?: string): Promise<ThreadRecord> {
     if (threadId) {
       const existing = await this.store.getThread(threadId);
@@ -255,12 +308,15 @@ export class ChatSession {
     systemPrompt?: string;
     metadata?: Record<string, unknown>;
   }): Promise<ThreadRecord> {
-    const thread = await this.store.createThread({
-      id: input?.id,
-      title: input?.title,
-      systemPrompt: input?.systemPrompt ?? this.defaultSystemPrompt,
-      metadata: input?.metadata,
-    });
+    const [thread] = await Promise.all([
+      this.store.createThread({
+        id: input?.id,
+        title: input?.title,
+        systemPrompt: input?.systemPrompt ?? this.defaultSystemPrompt,
+        metadata: input?.metadata,
+      }),
+      this.refreshProfileMemories(),
+    ]);
     this.previousCompiledMessages = undefined;
     this.pendingThreadSystemPrompt = undefined;
     this.patchSnapshot({
@@ -284,7 +340,7 @@ export class ChatSession {
     }
     this.previousCompiledMessages = undefined;
     this.pendingThreadSystemPrompt = undefined;
-    await this.refreshThreadNodes(thread);
+    await Promise.all([this.refreshThreadNodes(thread), this.refreshProfileMemories()]);
     this.patchSnapshot({
       streamingText: '',
       streamingReasoning: '',
@@ -306,6 +362,8 @@ export class ChatSession {
       explicitlyApprovedOrigins?: string[];
       titleIfFirst?: string;
       enableThinking?: boolean;
+      contextMessages?: readonly HarnessMessage[];
+      groundingText?: string;
     },
   ): Promise<void> {
     const trimmed = content.trim();
@@ -475,7 +533,54 @@ export class ChatSession {
   dispose(): void {
     this.abort();
     this.typingPrefill?.dispose();
+    this.consumePendingStreamingPatch();
     this.listeners.clear();
+  }
+
+  private consumePendingStreamingPatch(): Partial<ChatSessionSnapshot> {
+    if (this.streamRafId !== null) {
+      if (typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(this.streamRafId);
+      }
+      this.streamRafId = null;
+    }
+    const patch: Partial<ChatSessionSnapshot> = {};
+    if (this.pendingStreamingText !== undefined) {
+      patch.streamingText = this.pendingStreamingText;
+      this.pendingStreamingText = undefined;
+    }
+    if (this.pendingStreamingReasoning !== undefined) {
+      patch.streamingReasoning = this.pendingStreamingReasoning;
+      this.pendingStreamingReasoning = undefined;
+    }
+    return patch;
+  }
+
+  private flushStreamingUpdates(): void {
+    const patch = this.consumePendingStreamingPatch();
+    if (Object.keys(patch).length > 0) {
+      this.patchSnapshot(patch);
+    }
+  }
+
+  private queueStreamingUpdate(kind: 'text' | 'reasoning', acc: string): void {
+    if (kind === 'text') {
+      this.pendingStreamingText = acc;
+    } else {
+      this.pendingStreamingReasoning = acc;
+    }
+
+    if (acc === '' || typeof requestAnimationFrame !== 'function') {
+      this.flushStreamingUpdates();
+      return;
+    }
+
+    if (this.streamRafId === null) {
+      this.streamRafId = requestAnimationFrame(() => {
+        this.streamRafId = null;
+        this.flushStreamingUpdates();
+      });
+    }
   }
 
   private async flushPendingThreadSystemPrompt(threadId: string): Promise<void> {
@@ -490,6 +595,8 @@ export class ChatSession {
     activeOrigin?: string;
     explicitlyApprovedOrigins?: string[];
     enableThinking?: boolean;
+    contextMessages?: readonly HarnessMessage[];
+    groundingText?: string;
   }): Promise<void> {
     const thread = this.snapshot.thread;
     if (!thread) {
@@ -502,6 +609,7 @@ export class ChatSession {
     this.activeAbortController = controller;
     const turnId = createId('turn');
 
+    this.consumePendingStreamingPatch();
     this.patchSnapshot({
       streamingText: '',
       streamingReasoning: '',
@@ -516,11 +624,14 @@ export class ChatSession {
         environment: this.environment,
         adapter: this.adapter,
         messages: this.snapshot.messages,
+        contextMessages: options?.contextMessages ?? this.contextMessages,
+        groundingText: options?.groundingText,
         systemPrompt: thread.systemPrompt ?? this.defaultSystemPrompt,
         tools: this.tools,
         toolExecutor: this.toolExecutor,
         guard: this.guard,
         memory: this.memory,
+        cachedProfileMemories: this.cachedProfileMemories,
         compactor: this.compactor,
         compactionConfig: this.compactionConfig,
         slotCoordinator: this.slotCoordinator,
@@ -539,17 +650,21 @@ export class ChatSession {
         signal: controller.signal,
         stateMachine: this.fsm,
         onTextDelta: (_delta, acc) => {
-          this.patchSnapshot({ streamingText: acc });
+          this.queueStreamingUpdate('text', acc);
         },
         onReasoningDelta: (_delta, acc) => {
-          this.patchSnapshot({ streamingReasoning: acc });
+          this.queueStreamingUpdate('reasoning', acc);
         },
         onToolCallStart: (info) => {
+          const streamPatch = this.consumePendingStreamingPatch();
           const exists = this.snapshot.pendingToolCalls.some((t) => t.id === info.id);
           if (!exists) {
             this.patchSnapshot({
+              ...streamPatch,
               pendingToolCalls: [...this.snapshot.pendingToolCalls, { id: info.id, name: info.name }],
             });
+          } else if (Object.keys(streamPatch).length > 0) {
+            this.patchSnapshot(streamPatch);
           }
         },
         onCompaction: (plan) => {
@@ -566,6 +681,7 @@ export class ChatSession {
         },
       });
 
+      this.flushStreamingUpdates();
       this.previousCompiledMessages = result.compiledMessages;
 
       let parentId = thread.activeLeafNodeId;
@@ -601,45 +717,47 @@ export class ChatSession {
         parentId = partialNode.id;
       }
 
-      for (const trace of result.toolTraces) {
-        await this.store.appendToolTrace({
-          id: createId('trace'),
-          threadId: thread.id,
-          turnId,
-          step: trace.step,
-          toolName: trace.call.name,
-          arguments: trace.call.arguments,
-          resultFormatted: trace.result.formatted,
-          ok: trace.result.ok,
-          tainted: trace.result.tainted,
-          guardVerdict: trace.guardDecision.verdict,
-          durationMs: trace.durationMs,
-          createdAt: Date.now(),
-        });
-      }
-
-      const caps = await this.adapter.capabilities();
-      await this.store.appendTelemetry({
-        id: createId('tel'),
-        threadId: thread.id,
-        turnId,
-        adapterId: caps.id,
-        ttftMs: result.telemetry.ttftMs,
-        tokensPerSec: result.telemetry.tokensPerSec,
-        kvTokens: result.telemetry.kvTokens,
-        promptTokens: result.lastCompaction?.tokensAfter ?? estimateMessagesTokens(this.snapshot.messages),
-        outputTokens: estimateMessagesTokens(result.newMessages),
-        speculativeAcceptRate: result.telemetry.speculativeAcceptRate,
-        compactedSavedTokens: result.lastCompaction
-          ? Math.max(0, result.lastCompaction.tokensBefore - result.lastCompaction.tokensAfter)
-          : 0,
-        createdAt: Date.now(),
-      });
-
-      await this.store.updateThread(thread.id, {
-        rollingSummary: result.rollingSummary,
-        rollingSummaryCutoffId: result.rollingSummaryCutoffId,
-      });
+      await Promise.all([
+        ...result.toolTraces.map((trace) =>
+          this.store.appendToolTrace({
+            id: createId('trace'),
+            threadId: thread.id,
+            turnId,
+            step: trace.step,
+            toolName: trace.call.name,
+            arguments: trace.call.arguments,
+            resultFormatted: trace.result.formatted,
+            ok: trace.result.ok,
+            tainted: trace.result.tainted,
+            guardVerdict: trace.guardDecision.verdict,
+            durationMs: trace.durationMs,
+            createdAt: Date.now(),
+          }),
+        ),
+        (async () => {
+          const caps = await this.adapter.capabilities();
+          await this.store.appendTelemetry({
+            id: createId('tel'),
+            threadId: thread.id,
+            turnId,
+            adapterId: caps.id,
+            ttftMs: result.telemetry.ttftMs,
+            tokensPerSec: result.telemetry.tokensPerSec,
+            kvTokens: result.telemetry.kvTokens,
+            promptTokens: result.lastCompaction?.tokensAfter ?? estimateMessagesTokens(this.snapshot.messages),
+            outputTokens: estimateMessagesTokens(result.newMessages),
+            speculativeAcceptRate: result.telemetry.speculativeAcceptRate,
+            compactedSavedTokens: result.lastCompaction
+              ? Math.max(0, result.lastCompaction.tokensBefore - result.lastCompaction.tokensAfter)
+              : 0,
+            createdAt: Date.now(),
+          });
+        })(),
+        this.store.updateThread(thread.id, {
+          rollingSummary: result.rollingSummary,
+          rollingSummaryCutoffId: result.rollingSummaryCutoffId,
+        }),
+      ]);
 
       const refreshedThread = await this.store.getThread(thread.id);
       if (refreshedThread) {
@@ -659,6 +777,7 @@ export class ChatSession {
     } finally {
       this.activeAbortController = null;
       this.approvalResolver = null;
+      this.consumePendingStreamingPatch();
       this.fsm.reset();
       this.patchSnapshot({
         state: this.fsm.state,
@@ -672,14 +791,34 @@ export class ChatSession {
   }
 
   private async refreshThreadNodes(thread: ThreadRecord): Promise<void> {
-    const nodes = await this.store.getActivePath(thread.id);
-    const branchSiblings: Record<string, BranchSiblingInfo> = {};
-    for (const node of nodes) {
-      const info = await this.store.getBranchSiblings(node.id);
-      if (info && info.total > 1) {
-        branchSiblings[node.id] = info;
+    const allNodes = await this.store.listThreadNodes(thread.id);
+    const nodesById = new Map<string, MessageNode>();
+    const rootIds: string[] = [];
+
+    for (const node of allNodes) {
+      nodesById.set(node.id, node);
+      if (node.parentId === null) {
+        rootIds.push(node.id);
       }
     }
+
+    const nodes = buildActivePathFromMap(nodesById, thread.activeLeafNodeId);
+    const branchSiblings: Record<string, BranchSiblingInfo> = {};
+
+    for (const node of nodes) {
+      const siblingIds = node.parentId
+        ? (nodesById.get(node.parentId)?.childrenIds ?? [node.id])
+        : rootIds;
+      if (siblingIds.length > 1) {
+        branchSiblings[node.id] = {
+          nodeId: node.id,
+          siblingIds: [...siblingIds],
+          activeIndex: Math.max(0, siblingIds.indexOf(node.id)),
+          total: siblingIds.length,
+        };
+      }
+    }
+
     this.patchSnapshot({
       thread,
       nodes,

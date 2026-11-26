@@ -34,6 +34,8 @@ export interface CompactionInput {
   systemPrompt?: string;
   tools?: readonly ToolDefinition[];
   profileMemories?: readonly (Pick<MemoryRecord, 'id' | 'content'> | string)[];
+  /** Optional contextual messages (e.g. active page/tab context) placed immediately after Slot 0. */
+  contextMessages?: readonly HarnessMessage[];
   /** Conversation history excluding Slot 0 system message (though stray system msgs are filtered). */
   messages: readonly HarnessMessage[];
   /** Optional previous rolling summary state to extend without re-summarizing old turns. */
@@ -144,6 +146,7 @@ export function measureKvPrefixOverlap(
     if (
       prev.role === next.role &&
       prev.content === next.content &&
+      (prev.rawContent ?? prev.content) === (next.rawContent ?? next.content) &&
       prev.toolName === next.toolName
     ) {
       matchedCount += 1;
@@ -228,18 +231,49 @@ export class ContextCompactor {
       rawHistory.push(msg);
     }
 
+    // Deduplicate contextMessages against Slot 0 and rawHistory, keeping them immediately after Slot 0
+    const excludedIds = new Set<string>();
+    const excludedSignatures = new Set<string>();
+    const markExcluded = (msg: HarnessMessage) => {
+      excludedIds.add(msg.id);
+      excludedSignatures.add(`${msg.role}\x00${msg.toolName ?? ''}\x00${msg.content}`);
+    };
+    for (const msg of slot0.messages) markExcluded(msg);
+    for (const msg of rawHistory) markExcluded(msg);
+
+    const dedupedContextMessages: HarnessMessage[] = [];
+    for (const msg of input.contextMessages ?? []) {
+      const sig = `${msg.role}\x00${msg.toolName ?? ''}\x00${msg.content}`;
+      if (
+        msg.id.startsWith('slot0_') ||
+        isRollingSummaryMessage(msg) ||
+        excludedIds.has(msg.id) ||
+        excludedSignatures.has(sig)
+      ) {
+        continue;
+      }
+      markExcluded(msg);
+      dedupedContextMessages.push(msg);
+    }
+
+    const basePrefixMessages: HarnessMessage[] = [...slot0.messages, ...dedupedContextMessages];
+    const basePrefixTokens =
+      dedupedContextMessages.length > 0
+        ? await this.countTokens(basePrefixMessages)
+        : slot0.tokenCount;
+
     const availableHistoryBudget = Math.max(
       128,
       this.config.maxContextTokens -
-        slot0.tokenCount -
+        basePrefixTokens -
         this.config.reservedOutputTokens -
         this.config.safetyMarginTokens,
     );
 
-    const rawTokens = await this.countTokens([...slot0.messages, ...rawHistory]);
+    const rawTokens = await this.countTokens([...basePrefixMessages, ...rawHistory]);
 
     // Skip messages already folded into previousRollingSummary so we never double-summarize
-    // and so [Slot 0, Rolling Summary, ...kept] preserves KV prefix locality on subsequent turns.
+    // and so [Slot 0, Context, Rolling Summary, ...kept] preserves KV prefix locality on subsequent turns.
     let activeWindow = rawHistory;
     if (rollingSummary && rollingSummaryCutoffId) {
       const cutoffIdx = rawHistory.findIndex((m) => m.id === rollingSummaryCutoffId);
@@ -259,19 +293,19 @@ export class ContextCompactor {
       createdAt: 0,
     });
 
-    let currentPrefix: HarnessMessage[] = [...slot0.messages];
+    let currentPrefix: HarnessMessage[] = [...basePrefixMessages];
     if (rollingSummary) {
       currentPrefix.push(makeSummaryMessage(rollingSummary));
     }
 
     let currentTokens = await this.countTokens([...currentPrefix, ...workingHistory]);
     const triggerLimit =
-      slot0.tokenCount + Math.floor(availableHistoryBudget * this.config.triggerRatio);
+      basePrefixTokens + Math.floor(availableHistoryBudget * this.config.triggerRatio);
 
     let evictedMessageCount = 0;
 
     // Stage 3: Block-Aligned Rolling Summary if over budget or trigger threshold
-    if (currentTokens > triggerLimit || currentTokens > slot0.tokenCount + availableHistoryBudget) {
+    if (currentTokens > triggerLimit || currentTokens > basePrefixTokens + availableHistoryBudget) {
       const targetHistoryTokens = Math.floor(availableHistoryBudget * 0.72);
       const minKeep = Math.min(this.config.preserveRecentMessages, workingHistory.length);
       let splitIndex = workingHistory.length - minKeep;
@@ -321,13 +355,13 @@ export class ContextCompactor {
           : extractiveSummarize(evicted, rollingSummary, this.config.summaryMaxTokens);
 
         workingHistory = kept;
-        currentPrefix = [...slot0.messages, makeSummaryMessage(rollingSummary)];
+        currentPrefix = [...basePrefixMessages, makeSummaryMessage(rollingSummary)];
       }
 
       // Hard-cap guard if the final remaining message itself exceeds availableHistoryBudget
       const finalCompiled = [...currentPrefix, ...workingHistory];
       currentTokens = await this.countTokens(finalCompiled);
-      const hardMaxTotal = slot0.tokenCount + availableHistoryBudget;
+      const hardMaxTotal = basePrefixTokens + availableHistoryBudget;
 
       if (currentTokens > hardMaxTotal && workingHistory.length > 0) {
         const lastIdx = workingHistory.length - 1;
@@ -344,6 +378,7 @@ export class ContextCompactor {
             {
               ...lastMsg,
               content: `${lastMsg.content.slice(0, allowedChars)}\n[truncated to fit context budget]`,
+              rawContent: undefined,
             },
           ];
         }
@@ -367,7 +402,7 @@ export class ContextCompactor {
       rollingSummary,
       rollingSummaryCutoffId,
       summaryPrefixHash: summaryMsg
-        ? hashMessagesPrefix([slot0.messages[0]!, summaryMsg])
+        ? hashMessagesPrefix([...basePrefixMessages, summaryMsg])
         : null,
       tokensBefore: rawTokens,
       tokensAfter,

@@ -68,6 +68,7 @@ export interface HarnessMessage {
   id: string;
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  rawContent?: string;
   reasoning?: string;
   toolName?: string;
   toolCallId?: string;
@@ -86,6 +87,8 @@ export interface GenerateRequest {
   enableThinking?: boolean;
   pacingMode?: GpuPacingMode;
   prefixSlotKey?: string;
+  stopOnToolCall?: boolean;
+  groundingText?: string;
 }
 
 export type StreamDelta =
