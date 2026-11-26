@@ -195,4 +195,91 @@ describe('TurnStateMachine & Agentic Turn Runner', () => {
     expect(result.telemetry.abortLatencyMs).toBeDefined();
     expect(result.telemetry.abortLatencyMs!).toBeLessThan(100);
   });
+
+  it('resets onTextDelta on orphan </think> and persists msg.reasoning', async () => {
+    const adapter = createMockAdapter([
+      async function* () {
+        yield { type: 'text', delta: 'Checking ' };
+        yield { type: 'text', delta: 'math...</thi' };
+        yield { type: 'text', delta: 'nk>\n\nThe answer is 42.' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+    ]);
+
+    const textDeltas: Array<{ delta: string; acc: string; step: number }> = [];
+    const reasoningDeltas: Array<{ delta: string; acc: string; step: number }> = [];
+
+    const result = await runHarnessTurn({
+      sessionId: 'sess_orphan_think',
+      adapter,
+      messages: [{ id: 'u1', role: 'user', content: 'What is 6*7?', createdAt: 1 }],
+      onTextDelta: (delta, acc, step) => {
+        textDeltas.push({ delta, acc, step });
+      },
+      onReasoningDelta: (delta, acc, step) => {
+        reasoningDeltas.push({ delta, acc, step });
+      },
+    });
+
+    expect(result.finalState).toBe('done');
+    expect(result.finalText).toBe('The answer is 42.');
+    expect(result.reasoningText).toBe('Checking math...');
+    expect(result.newMessages).toHaveLength(1);
+    expect(result.newMessages[0]?.content).toBe('The answer is 42.');
+    expect(result.newMessages[0]?.reasoning).toBe('Checking math...');
+    expect(textDeltas).toEqual([
+      { delta: 'Checking ', acc: 'Checking ', step: 0 },
+      { delta: 'math...', acc: 'Checking math...', step: 0 },
+      { delta: '', acc: '', step: 0 },
+      { delta: 'The answer is 42.', acc: 'The answer is 42.', step: 0 },
+    ]);
+    expect(reasoningDeltas).toEqual([
+      { delta: 'Checking math...', acc: 'Checking math...', step: 0 },
+    ]);
+  });
+
+  it('persists reasoning onto assistantToolMsg when tool calls follow thinking', async () => {
+    const toolExecutor: ToolExecutor = {
+      listTools: () => TOOLS,
+      async execute(name) {
+        return {
+          ok: true,
+          toolName: name,
+          formatted: 'Tab content',
+          tainted: false,
+        };
+      },
+    };
+
+    const adapter = createMockAdapter([
+      async function* () {
+        yield {
+          type: 'text',
+          delta: '<|channel>thought\nInspect tab first\n<channel|><tool_call>{"name":"read_active_tab","arguments":{}}</tool_call>',
+        };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+      async function* () {
+        yield { type: 'text', delta: '<think>Got tab</think>\n\nSummary ready.' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+    ]);
+
+    const result = await runHarnessTurn({
+      sessionId: 'sess_tool_think',
+      adapter,
+      messages: [{ id: 'u1', role: 'user', content: 'Summarize tab', createdAt: 1 }],
+      tools: TOOLS,
+      toolExecutor,
+    });
+
+    expect(result.finalText).toBe('Summary ready.');
+    expect(result.newMessages).toHaveLength(3);
+    expect(result.newMessages[0]?.role).toBe('assistant');
+    expect(result.newMessages[0]?.toolName).toBe('read_active_tab');
+    expect(result.newMessages[0]?.reasoning).toBe('Inspect tab first');
+    expect(result.newMessages[2]?.role).toBe('assistant');
+    expect(result.newMessages[2]?.content).toBe('Summary ready.');
+    expect(result.newMessages[2]?.reasoning).toBe('Got tab');
+  });
 });

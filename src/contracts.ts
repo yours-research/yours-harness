@@ -68,6 +68,7 @@ export interface HarnessMessage {
   id: string;
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  reasoning?: string;
   toolName?: string;
   toolCallId?: string;
   toolArgs?: Record<string, unknown>;

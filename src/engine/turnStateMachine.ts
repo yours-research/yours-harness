@@ -18,7 +18,11 @@ import type {
 } from '../contracts.js';
 import { createId } from '../utils/id.js';
 import type { PrefixSlotCoordinator } from './speculative.js';
-import { StreamOutputParser, type ParsedToolCall } from './streamParser.js';
+import {
+  StreamOutputParser,
+  type ParsedToolCall,
+  type StreamParserStepOutput,
+} from './streamParser.js';
 
 export type TurnState =
   | 'idle'
@@ -357,6 +361,29 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
       let stepAccumulatedReasoning = '';
       let adapterFinishReason: 'stop' | 'length' | 'tool_calls' | 'abort' = 'stop';
 
+      const applyParserStep = (parsed: StreamParserStepOutput) => {
+        if (parsed.visibleTextReset) {
+          stepAccumulatedText = '';
+          params.onTextDelta?.('', '', step);
+        }
+        if (parsed.reasoningDelta) {
+          stepAccumulatedReasoning += parsed.reasoningDelta;
+          reasoningText += parsed.reasoningDelta;
+          params.onReasoningDelta?.(parsed.reasoningDelta, stepAccumulatedReasoning, step);
+        }
+        if (parsed.textDelta) {
+          stepAccumulatedText += parsed.textDelta;
+          params.onTextDelta?.(parsed.textDelta, stepAccumulatedText, step);
+        }
+        if (parsed.pendingToolCall) {
+          params.onToolCallStart?.({
+            step,
+            id: `pending_${step}`,
+            name: parsed.pendingToolCall.name,
+          });
+        }
+      };
+
       for await (const delta of params.adapter.generate(
         {
           messages: plan.compiledMessages,
@@ -378,23 +405,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
 
         switch (delta.type) {
           case 'text': {
-            const parsed = parser.pushText(delta.delta);
-            if (parsed.reasoningDelta) {
-              stepAccumulatedReasoning += parsed.reasoningDelta;
-              reasoningText += parsed.reasoningDelta;
-              params.onReasoningDelta?.(parsed.reasoningDelta, stepAccumulatedReasoning, step);
-            }
-            if (parsed.textDelta) {
-              stepAccumulatedText += parsed.textDelta;
-              params.onTextDelta?.(parsed.textDelta, stepAccumulatedText, step);
-            }
-            if (parsed.pendingToolCall) {
-              params.onToolCallStart?.({
-                step,
-                id: `pending_${step}`,
-                name: parsed.pendingToolCall.name,
-              });
-            }
+            applyParserStep(parser.pushText(delta.delta));
             break;
           }
           case 'reasoning': {
@@ -442,16 +453,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         }
       }
 
-      const flushed = parser.flush();
-      if (flushed.reasoningDelta) {
-        stepAccumulatedReasoning += flushed.reasoningDelta;
-        reasoningText += flushed.reasoningDelta;
-        params.onReasoningDelta?.(flushed.reasoningDelta, stepAccumulatedReasoning, step);
-      }
-      if (flushed.textDelta) {
-        stepAccumulatedText += flushed.textDelta;
-        params.onTextDelta?.(flushed.textDelta, stepAccumulatedText, step);
-      }
+      applyParserStep(parser.flush());
 
       if (localController.signal.aborted || adapterFinishReason === 'abort') {
         finishReason = 'abort';
@@ -461,6 +463,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
       const parsedInlineTools = parser.getToolCalls();
       const allToolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : parsedInlineTools;
       const cleanVisible = parser.getVisibleText().trim() || stepAccumulatedText.trim();
+      const trimmedReasoning = stepAccumulatedReasoning.trim();
 
       params.slotCoordinator?.setLiveMessages([
         ...plan.compiledMessages,
@@ -483,6 +486,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
           id: createId('msg'),
           role: 'assistant',
           content: cleanVisible,
+          ...(trimmedReasoning ? { reasoning: trimmedReasoning } : {}),
           createdAt: Date.now(),
         };
         history.push(assistantMsg);
@@ -503,6 +507,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
         id: createId('msg'),
         role: 'assistant',
         content: cleanVisible,
+        ...(trimmedReasoning ? { reasoning: trimmedReasoning } : {}),
         toolName: firstCall.name,
         toolCallId: firstCall.id,
         toolArgs: firstCall.arguments,

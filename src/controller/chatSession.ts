@@ -54,6 +54,19 @@ export interface ChatSessionOptions {
   persistAbortedPartial?: boolean;
 }
 
+export type ChatSessionUpdateOptions = Partial<
+  Pick<
+    ChatSessionOptions,
+    | 'enableThinking'
+    | 'pacingMode'
+    | 'maxNewTokens'
+    | 'temperature'
+    | 'topP'
+    | 'topK'
+    | 'systemPrompt'
+  >
+>;
+
 export interface ChatSessionSnapshot {
   thread: ThreadRecord | null;
   nodes: MessageNode[];
@@ -88,7 +101,7 @@ export class ChatSession {
   private readonly adapter: RuntimeAdapter;
   private readonly store: HarnessStore;
   private readonly environment: ToolInvocationContext['environment'];
-  private readonly defaultSystemPrompt?: string;
+  private defaultSystemPrompt?: string;
   private readonly tools?: readonly ToolDefinition[];
   private readonly toolExecutor?: ToolExecutor;
   private readonly guard?: GuardEngine;
@@ -96,12 +109,12 @@ export class ChatSession {
   private readonly compactor?: ContextCompactor;
   private readonly compactionConfig?: Partial<CompactionBudgetConfig>;
   private readonly maxToolSteps?: number;
-  private readonly maxNewTokens?: number;
-  private readonly temperature?: number;
-  private readonly topP?: number;
-  private readonly topK?: number;
-  private readonly enableThinking?: boolean;
-  private readonly pacingMode?: GpuPacingMode;
+  private maxNewTokens?: number;
+  private temperature?: number;
+  private topP?: number;
+  private topK?: number;
+  private enableThinking?: boolean;
+  private pacingMode?: GpuPacingMode;
   private readonly persistAbortedPartial: boolean;
 
   private readonly fsm = new TurnStateMachine();
@@ -112,6 +125,7 @@ export class ChatSession {
   private activeAbortController: AbortController | null = null;
   private approvalResolver: ((approved: boolean) => void) | null = null;
   private previousCompiledMessages: HarnessMessage[] | undefined;
+  private pendingThreadSystemPrompt?: { threadId: string; systemPrompt: string | undefined };
 
   private snapshot: ChatSessionSnapshot = {
     thread: null,
@@ -194,6 +208,36 @@ export class ChatSession {
     return this.snapshot;
   };
 
+  updateOptions(patch: ChatSessionUpdateOptions): void {
+    if ('enableThinking' in patch) this.enableThinking = patch.enableThinking;
+    if ('pacingMode' in patch) this.pacingMode = patch.pacingMode;
+    if ('maxNewTokens' in patch) this.maxNewTokens = patch.maxNewTokens;
+    if ('temperature' in patch) this.temperature = patch.temperature;
+    if ('topP' in patch) this.topP = patch.topP;
+    if ('topK' in patch) this.topK = patch.topK;
+    if ('systemPrompt' in patch) {
+      const prevDefault = this.defaultSystemPrompt;
+      this.defaultSystemPrompt = patch.systemPrompt;
+      if (
+        this.snapshot.thread &&
+        patch.systemPrompt !== prevDefault &&
+        (this.snapshot.thread.systemPrompt === prevDefault ||
+          this.snapshot.thread.systemPrompt === undefined)
+      ) {
+        this.pendingThreadSystemPrompt = {
+          threadId: this.snapshot.thread.id,
+          systemPrompt: patch.systemPrompt,
+        };
+        this.patchSnapshot({
+          thread: {
+            ...this.snapshot.thread,
+            systemPrompt: patch.systemPrompt,
+          },
+        });
+      }
+    }
+  }
+
   async init(threadId?: string): Promise<ThreadRecord> {
     if (threadId) {
       const existing = await this.store.getThread(threadId);
@@ -218,6 +262,7 @@ export class ChatSession {
       metadata: input?.metadata,
     });
     this.previousCompiledMessages = undefined;
+    this.pendingThreadSystemPrompt = undefined;
     this.patchSnapshot({
       thread,
       nodes: [],
@@ -238,6 +283,7 @@ export class ChatSession {
       throw new Error(`Thread not found: ${threadId}`);
     }
     this.previousCompiledMessages = undefined;
+    this.pendingThreadSystemPrompt = undefined;
     await this.refreshThreadNodes(thread);
     this.patchSnapshot({
       streamingText: '',
@@ -259,6 +305,7 @@ export class ChatSession {
       activeOrigin?: string;
       explicitlyApprovedOrigins?: string[];
       titleIfFirst?: string;
+      enableThinking?: boolean;
     },
   ): Promise<void> {
     const trimmed = content.trim();
@@ -276,10 +323,13 @@ export class ChatSession {
       thread = await this.createThread({
         title: options?.titleIfFirst ?? trimmed.slice(0, 60),
       });
-    } else if (this.snapshot.nodes.length === 0 && thread.title === 'New Conversation') {
-      thread = await this.store.updateThread(thread.id, {
-        title: options?.titleIfFirst ?? trimmed.slice(0, 60),
-      });
+    } else {
+      await this.flushPendingThreadSystemPrompt(thread.id);
+      if (this.snapshot.nodes.length === 0 && thread.title === 'New Conversation') {
+        thread = await this.store.updateThread(thread.id, {
+          title: options?.titleIfFirst ?? trimmed.slice(0, 60),
+        });
+      }
     }
 
     const parentId = thread.activeLeafNodeId;
@@ -315,6 +365,8 @@ export class ChatSession {
       throw new Error('Cannot branch while a turn is in progress.');
     }
 
+    await this.flushPendingThreadSystemPrompt(thread.id);
+
     const target = await this.store.getNode(nodeId);
     if (!target) {
       throw new Error(`Message node not found: ${nodeId}`);
@@ -345,6 +397,8 @@ export class ChatSession {
     if (isActiveTurnState(this.snapshot.state)) {
       throw new Error('Cannot regenerate while a turn is in progress.');
     }
+
+    await this.flushPendingThreadSystemPrompt(thread.id);
 
     const nodes = this.snapshot.nodes;
     const targetNode = assistantNodeId
@@ -424,14 +478,25 @@ export class ChatSession {
     this.listeners.clear();
   }
 
+  private async flushPendingThreadSystemPrompt(threadId: string): Promise<void> {
+    if (this.pendingThreadSystemPrompt?.threadId === threadId) {
+      const { systemPrompt } = this.pendingThreadSystemPrompt;
+      this.pendingThreadSystemPrompt = undefined;
+      await this.store.updateThread(threadId, { systemPrompt });
+    }
+  }
+
   private async executeTurnFromCurrentPath(options?: {
     activeOrigin?: string;
     explicitlyApprovedOrigins?: string[];
+    enableThinking?: boolean;
   }): Promise<void> {
     const thread = this.snapshot.thread;
     if (!thread) {
       return;
     }
+
+    await this.flushPendingThreadSystemPrompt(thread.id);
 
     const controller = new AbortController();
     this.activeAbortController = controller;
@@ -466,7 +531,7 @@ export class ChatSession {
         temperature: this.temperature,
         topP: this.topP,
         topK: this.topK,
-        enableThinking: this.enableThinking,
+        enableThinking: options?.enableThinking ?? this.enableThinking,
         pacingMode: this.pacingMode,
         previousRollingSummary: thread.rollingSummary,
         previousRollingSummaryCutoffId: thread.rollingSummaryCutoffId,
@@ -520,6 +585,7 @@ export class ChatSession {
         result.newMessages.length === 0 &&
         this.snapshot.streamingText.trim().length > 0
       ) {
+        const trimmedReasoning = this.snapshot.streamingReasoning.trim();
         const partialNode = await this.store.appendMessage({
           threadId: thread.id,
           parentId,
@@ -527,6 +593,7 @@ export class ChatSession {
             id: createId('msg'),
             role: 'assistant',
             content: this.snapshot.streamingText,
+            ...(trimmedReasoning ? { reasoning: trimmedReasoning } : {}),
             createdAt: Date.now(),
           },
           setActive: true,
