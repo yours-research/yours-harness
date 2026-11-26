@@ -236,4 +236,40 @@ describe('KV-Cache-Preserving Context Compaction', () => {
     expect(plan2.compiledMessages[1]?.id).toBe('ctx_page');
     expect(plan2.kvPrefixPreservedMessages).toBeGreaterThanOrEqual(3); // Slot 0 + contextMsg1 + rolling summary
   });
+
+  it('retains early user constraints and concrete tool facts when evicting heavy trailing status chatter', async () => {
+    const compactor = new ContextCompactor({
+      maxContextTokens: 512,
+      reservedOutputTokens: 200,
+      safetyMarginTokens: 0,
+      triggerRatio: 0.85,
+      preserveRecentMessages: 2,
+      summaryMaxTokens: 96,
+    });
+
+    const history: HarnessMessage[] = [
+      msg('u0', 'user', 'Find a USB4 monitor under $350 shipping to 94107.'),
+      msg('t0', 'tool', 'Found SKU-9921-BLK at $329 in stock for zip 94107.', { toolName: 'read_tab' }),
+      msg('a0', 'assistant', 'Selected SKU-9921-BLK ($329) shipping to 94107.'),
+      ...Array.from({ length: 24 }, (_, i) =>
+        msg(
+          `noise_${i}`,
+          i % 2 === 0 ? 'assistant' : 'user',
+          `Checking intermediate status step ${i + 1}: waiting for background worker panel synchronization telemetry pass.`,
+        ),
+      ),
+      msg('u_last', 'user', 'What SKU, price, and zip did we confirm earlier?'),
+    ];
+
+    const plan = await compactor.compact({
+      systemPrompt: 'You are a concise assistant.',
+      messages: history,
+    });
+
+    expect(plan.didCompact).toBe(true);
+    expect(plan.rollingSummary).toContain('SKU-9921-BLK');
+    expect(plan.rollingSummary).toContain('$329');
+    expect(plan.rollingSummary).toContain('94107');
+    expect(plan.tokensAfter).toBeLessThanOrEqual(312);
+  });
 });

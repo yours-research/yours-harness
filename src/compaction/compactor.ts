@@ -71,9 +71,63 @@ function isRollingSummaryMessage(msg: HarnessMessage): boolean {
   return msg.role === 'system' && msg.content.startsWith(ROLLING_SUMMARY_PREFIX);
 }
 
+interface SummaryCandidate {
+  order: number;
+  text: string;
+  skeleton: string;
+  fromPrevious: boolean;
+  score: number;
+}
+
+const ENTITY_CODE_RE = /\b[A-Z]{2,}[_-][A-Z0-9_-]+\b/g;
+const HEX_HASH_RE = /\b[0-9a-f]{7,40}\b/gi;
+const NUMBER_OR_PRICE_RE = /(?:[$€£¥]?\d[\d.,:%-]*|\bzip\s+\d{5}\b)/gi;
+const URL_TOKEN_RE = /https?:\/\/[^\s)>\]]+/gi;
+const FILLER_CHATTER_RE =
+  /\b(intermediate\s+status|inspected\s+panel|checking\s+step|acknowledged|working\s+on\s+it|continuing\s+analysis)\b/i;
+
+function computeSummarySalience(
+  msg: HarnessMessage | null,
+  line: string,
+  order: number,
+  fromPrevious: boolean,
+): number {
+  let score = fromPrevious ? 3.2 : 0;
+  if (msg) {
+    if (msg.role === 'tool') {
+      score += line.includes('[Folded ') ? 1.5 : 4.0;
+    } else if (msg.role === 'user') {
+      score += 3.2;
+    } else {
+      score += 1.8;
+    }
+  }
+  if (order <= 1) {
+    score += 3.5;
+  }
+
+  const codes = line.match(ENTITY_CODE_RE)?.length ?? 0;
+  const hashes = line.match(HEX_HASH_RE)?.length ?? 0;
+  const nums = line.match(NUMBER_OR_PRICE_RE)?.length ?? 0;
+  const urls = line.match(URL_TOKEN_RE)?.length ?? 0;
+  const hyphens = line.match(/\b[a-z]{2,}-[a-z0-9]{2,}\b/gi)?.length ?? 0;
+
+  score += Math.min(9, codes * 2.5 + hashes * 2.0 + nums * 1.1 + urls * 1.5 + hyphens * 1.0);
+
+  if (FILLER_CHATTER_RE.test(line)) {
+    score -= 4.5;
+  }
+  return score;
+}
+
+function bulletSkeleton(text: string): string {
+  return text.toLowerCase().replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
+}
+
 /**
  * Deterministic extractive summarizer requiring zero extra LLM calls.
- * Ideal for fixed-VRAM / latency-sensitive local execution.
+ * Prioritizes high-salience constraints, identifiers, and tool findings over
+ * repetitive status chatter while fitting cleanly inside `maxTokens`.
  */
 export function extractiveSummarize(
   evictedMessages: readonly HarnessMessage[],
@@ -81,10 +135,22 @@ export function extractiveSummarize(
   maxTokens = 320,
 ): string {
   const maxChars = Math.max(160, Math.floor(maxTokens * 3.4));
-  const bullets: string[] = [];
+  const candidates: SummaryCandidate[] = [];
 
   if (previousSummary && previousSummary.trim()) {
-    bullets.push(previousSummary.trim());
+    for (const rawLine of previousSummary.split(/\r?\n/)) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) continue;
+      const line = trimmed.startsWith('- ') ? trimmed : `- ${trimmed}`;
+      const order = candidates.length;
+      candidates.push({
+        order,
+        text: line,
+        skeleton: bulletSkeleton(line),
+        fromPrevious: true,
+        score: computeSummarySalience(null, line, order, true),
+      });
+    }
   }
 
   for (const msg of evictedMessages) {
@@ -101,30 +167,69 @@ export function extractiveSummarize(
         : msg.role === 'assistant'
           ? 'Assistant'
           : `Tool(${msg.toolName ?? 'tool'})`;
-    const snippet = clean.length > 140 ? `${clean.slice(0, 137)}...` : clean;
-    bullets.push(`- ${label}: ${snippet}`);
+    const snippet = clean.length > 160 ? `${clean.slice(0, 157)}...` : clean;
+    const line = `- ${label}: ${snippet}`;
+    const order = candidates.length;
+    candidates.push({
+      order,
+      text: line,
+      skeleton: bulletSkeleton(line),
+      fromPrevious: false,
+      score: computeSummarySalience(msg, line, order, false),
+    });
   }
 
-  let combined = bullets.join('\n');
-  if (combined.length > maxChars) {
-    // Keep most recent summary facts if over cap
-    const trimmedLines: string[] = [];
-    let chars = 0;
-    for (let i = bullets.length - 1; i >= 0; i -= 1) {
-      const line = bullets[i]!;
-      if (chars + line.length + 1 > maxChars && trimmedLines.length > 0) {
-        break;
-      }
-      trimmedLines.unshift(line);
-      chars += line.length + 1;
+  if (candidates.length === 0) {
+    return '';
+  }
+
+  const skeletonCounts = new Map<string, number>();
+  for (const c of candidates) {
+    skeletonCounts.set(c.skeleton, (skeletonCounts.get(c.skeleton) ?? 0) + 1);
+  }
+
+  // Down-rank and deduplicate repetitive template lines while keeping one exemplar if space allows.
+  const seenSkeletons = new Set<string>();
+  const ranked = candidates
+    .map((c) => {
+      const count = skeletonCounts.get(c.skeleton) ?? 1;
+      const isRepeatedTemplate = count > 1;
+      const penalizedScore = isRepeatedTemplate ? c.score - Math.min(6, count * 1.5) : c.score;
+      return { ...c, score: penalizedScore, isRepeatedTemplate };
+    })
+    .filter((c) => {
+      if (!c.isRepeatedTemplate) return true;
+      if (seenSkeletons.has(c.skeleton)) return false;
+      seenSkeletons.add(c.skeleton);
+      return true;
+    })
+    .sort((a, b) => b.score - a.score || a.order - b.order);
+
+  const selected: SummaryCandidate[] = [];
+  let usedChars = 0;
+
+  for (const cand of ranked) {
+    const lineCost = cand.text.length + (selected.length > 0 ? 1 : 0);
+    if (usedChars + lineCost <= maxChars) {
+      selected.push(cand);
+      usedChars += lineCost;
+      continue;
     }
-    combined = trimmedLines.join('\n');
-    if (combined.length > maxChars) {
-      combined = combined.slice(combined.length - maxChars);
+    const remaining = maxChars - usedChars - (selected.length > 0 ? 1 : 0);
+    if (remaining >= 56 && cand.score >= 3) {
+      const clipped = `${cand.text.slice(0, remaining - 3).trimEnd()}...`;
+      selected.push({ ...cand, text: clipped });
+      usedChars += clipped.length + (selected.length > 1 ? 1 : 0);
     }
   }
 
-  return combined;
+  if (selected.length === 0 && ranked[0]) {
+    const first = ranked[0].text;
+    return first.length > maxChars ? `${first.slice(0, Math.max(0, maxChars - 3))}...` : first;
+  }
+
+  selected.sort((a, b) => a.order - b.order);
+  return selected.map((c) => c.text).join('\n');
 }
 
 /**
