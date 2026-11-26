@@ -340,4 +340,22 @@ describe('StreamOutputParser & Malformed JSON Recovery', () => {
     expect(flush2.toolCallsReady).toHaveLength(1);
     expect(flush2.toolCallsReady[0]?.name).toBe('run_sandbox');
   });
+
+  it('extracts flat top-level JSON tool arguments when nested "arguments" wrapper is omitted', () => {
+    const parser1 = new StreamOutputParser();
+    parser1.pushText('<tool_call>{"name":"read_tab","tab_id": 1877833099, mode: "article"}</tool_call>');
+    parser1.flush();
+    const calls1 = parser1.getToolCalls();
+    expect(calls1).toHaveLength(1);
+    expect(calls1[0]?.name).toBe('read_tab');
+    expect(calls1[0]?.arguments).toEqual({ tab_id: 1877833099, mode: 'article' });
+
+    const parser2 = new StreamOutputParser();
+    parser2.pushText('<tool_call>{"name":"run_sandbox","expression":"12500 * 2"}</tool_call>');
+    parser2.flush();
+    const calls2 = parser2.getToolCalls();
+    expect(calls2).toHaveLength(1);
+    expect(calls2[0]?.name).toBe('run_sandbox');
+    expect(calls2[0]?.arguments).toEqual({ expression: '12500 * 2' });
+  });
 });

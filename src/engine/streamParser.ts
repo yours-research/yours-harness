@@ -355,12 +355,19 @@ export function extractToolCallFromPayload(
   if (typeof rawName !== 'string' || !rawName.trim()) {
     return null;
   }
-  const rawArgs = parsed.arguments ?? parsed.args ?? parsed.parameters ?? {};
+  const explicitArgs = parsed.arguments ?? parsed.args ?? parsed.parameters ?? parsed.input;
   let args: Record<string, unknown> = {};
-  if (typeof rawArgs === 'string') {
-    args = parseLenientJsonObject(rawArgs) ?? {};
-  } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
-    args = rawArgs as Record<string, unknown>;
+  if (typeof explicitArgs === 'string') {
+    args = parseLenientJsonObject(explicitArgs) ?? {};
+  } else if (explicitArgs && typeof explicitArgs === 'object' && !Array.isArray(explicitArgs)) {
+    args = explicitArgs as Record<string, unknown>;
+  } else if (explicitArgs === undefined) {
+    // Support small-model flat payloads such as {"name":"read_tab","tab_id":123,"mode":"article"}
+    for (const [key, val] of Object.entries(parsed)) {
+      if (key !== 'name' && key !== 'tool' && key !== 'function' && key !== 'id' && key !== 'type') {
+        args[key] = val;
+      }
+    }
   }
 
   return {
