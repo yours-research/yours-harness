@@ -303,4 +303,26 @@ describe('KV-Cache-Preserving Context Compaction', () => {
     expect(citation).toContain('8443');
     expect(folded.messages[1]?.tainted).toBe(true);
   });
+
+  it('folds medium-sized (>=300 char) completed turn tool outputs by default with tight excerpt bounds', () => {
+    const mediumOutput = [
+      'Pipeline diagnostics summary from node cluster across edge workers and local GPU queues:',
+      'General telemetry note: ring buffers nominal, shader pipelines warmed, and scheduler idle across background tabs.',
+      'General telemetry note two: zero unhandled rejections observed during idle warmup pass in chromium side panel.',
+      'Primary endpoint https://cluster.local/status assigned port 9104 and token CLUSTER-MID-307 with 4 active shards across eu-west-1.',
+    ].join('\n');
+    expect(mediumOutput.length).toBeGreaterThanOrEqual(300);
+
+    const folded = foldTransientToolResults([
+      msg('u1', 'user', 'Check cluster status'),
+      msg('t1', 'tool', mediumOutput, { toolName: 'read_tab', tainted: true }),
+      msg('a1', 'assistant', 'Cluster is nominal on port 9104.'),
+      msg('u2', 'user', 'Next question'),
+    ]);
+
+    expect(folded.foldedCount).toBe(1);
+    expect(folded.messages[1]?.content).toContain('[Folded read_tab output');
+    expect(folded.messages[1]?.content).toContain('9104');
+    expect(folded.messages[1]?.content.length).toBeLessThan(mediumOutput.length);
+  });
 });

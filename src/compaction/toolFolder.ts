@@ -4,7 +4,7 @@ import { estimateTextTokens } from '../utils/tokens.js';
 export interface ToolFoldingOptions {
   /** Number of most recent user turns whose tool outputs stay verbatim (default: 1). */
   preserveRecentTurns?: number;
-  /** Minimum character length before a stale tool result is folded (default: 360). */
+  /** Minimum character length before a stale tool result is folded (default: 300). */
   foldThresholdChars?: number;
   /** Maximum characters kept as semantic excerpt inside folded citation (default: 180). */
   excerptMaxChars?: number;
@@ -148,8 +148,8 @@ export function foldTransientToolResults(
   options: ToolFoldingOptions = {},
 ): ToolFoldingResult {
   const preserveRecentTurns = Math.max(1, options.preserveRecentTurns ?? 1);
-  const foldThresholdChars = Math.max(80, options.foldThresholdChars ?? 360);
-  const excerptMaxChars = Math.max(40, options.excerptMaxChars ?? 220);
+  const foldThresholdChars = Math.max(80, options.foldThresholdChars ?? 300);
+  const excerptMaxChars = Math.max(40, options.excerptMaxChars ?? 180);
 
   if (messages.length === 0) {
     return { messages: [], foldedCount: 0, savedTokensEstimate: 0 };
