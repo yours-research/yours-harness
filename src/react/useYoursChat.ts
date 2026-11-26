@@ -3,6 +3,7 @@ import {
   ChatSession,
   type ChatSessionOptions,
   type ChatSessionSnapshot,
+  type ChatSessionUpdateOptions,
 } from '../controller/chatSession.js';
 import type { ThreadRecord, ThreadSearchHit } from '../storage/types.js';
 
@@ -21,8 +22,10 @@ export interface UseYoursChatResult extends ChatSessionSnapshot {
       activeOrigin?: string;
       explicitlyApprovedOrigins?: string[];
       titleIfFirst?: string;
+      enableThinking?: boolean;
     },
   ) => Promise<void>;
+  updateOptions: (patch: ChatSessionUpdateOptions) => void;
   editAndBranch: (nodeId: string, newContent: string) => Promise<void>;
   regenerate: (assistantNodeId?: string) => Promise<void>;
   switchBranch: (branchNodeId: string) => Promise<void>;
@@ -63,6 +66,30 @@ export function useYoursChat(options: UseYoursChatOptions): UseYoursChatResult {
   );
 
   useEffect(() => {
+    if (!ownsSessionRef.current) {
+      return;
+    }
+    session.updateOptions({
+      enableThinking: options.enableThinking,
+      pacingMode: options.pacingMode,
+      maxNewTokens: options.maxNewTokens,
+      temperature: options.temperature,
+      topP: options.topP,
+      topK: options.topK,
+      systemPrompt: options.systemPrompt,
+    });
+  }, [
+    session,
+    options.enableThinking,
+    options.pacingMode,
+    options.maxNewTokens,
+    options.temperature,
+    options.topP,
+    options.topK,
+    options.systemPrompt,
+  ]);
+
+  useEffect(() => {
     if (options.autoInit === false) {
       return;
     }
@@ -86,8 +113,14 @@ export function useYoursChat(options: UseYoursChatOptions): UseYoursChatResult {
         activeOrigin?: string;
         explicitlyApprovedOrigins?: string[];
         titleIfFirst?: string;
+        enableThinking?: boolean;
       },
     ) => session.sendMessage(content, sendOptions),
+    [session],
+  );
+
+  const updateOptions = useCallback(
+    (patch: ChatSessionUpdateOptions) => session.updateOptions(patch),
     [session],
   );
 
@@ -136,6 +169,7 @@ export function useYoursChat(options: UseYoursChatOptions): UseYoursChatResult {
     ...snapshot,
     session,
     send,
+    updateOptions,
     editAndBranch,
     regenerate,
     switchBranch,

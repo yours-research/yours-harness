@@ -10,6 +10,8 @@ export interface StreamParserOptions {
   stopOnToolCall?: boolean;
   /** Allow recovering bare JSON tool call objects without <tool_call> tags (default: true). */
   allowBareJsonToolCall?: boolean;
+  /** Initial parser mode (default: 'text'). */
+  initialMode?: 'text' | 'think';
   /** Optional deterministic ID factory for parsed tool calls. */
   makeToolCallId?: (index: number) => string;
 }
@@ -20,14 +22,15 @@ export interface StreamParserStepOutput {
   pendingToolCall: { name: string } | null;
   toolCallsReady: ParsedToolCall[];
   stopSequenceHit: string | null;
+  visibleTextReset?: boolean;
 }
 
 const DEFAULT_STOP_SEQUENCES = ['<|im_end|>', '<|endoftext|>', '<end_of_turn>'];
 const PARTIAL_NAME_RE = /["']?name["']?\s*:\s*["']([^"']+)["']/;
 const TOOL_CALL_OPEN_TAG = '<tool_call>';
 const TOOL_CALL_CLOSE_TAG = '</tool_call>';
-const THINK_OPEN_TAGS = ['<think>', '<thought>'];
-const THINK_CLOSE_TAGS = ['</think>', '</thought>'];
+const THINK_OPEN_TAGS = ['<think>', '<thought>', '<|channel>thought\n', '<|channel>thought', '<|thought|>'];
+const THINK_CLOSE_TAGS = ['</think>', '</thought>', '<channel|>', '<|/thought|>', '<|end_of_thought|>'];
 
 /**
  * Attempts to parse a JSON object even with common small-model formatting quirks:
@@ -170,7 +173,10 @@ function findEarliestIndex(haystack: string, needles: readonly string[]): { inde
   let bestTag = '';
   for (const needle of needles) {
     const idx = haystack.indexOf(needle);
-    if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+    if (
+      idx !== -1 &&
+      (bestIdx === -1 || idx < bestIdx || (idx === bestIdx && needle.length > bestTag.length))
+    ) {
       bestIdx = idx;
       bestTag = needle;
     }
@@ -194,9 +200,20 @@ function trailingPartialPrefixLength(buffer: string, tokens: readonly string[]):
   return maxKeep;
 }
 
+function emptyStepOutput(): StreamParserStepOutput {
+  return {
+    textDelta: '',
+    reasoningDelta: '',
+    pendingToolCall: null,
+    toolCallsReady: [],
+    stopSequenceHit: null,
+    visibleTextReset: false,
+  };
+}
+
 /**
  * Incremental streaming parser tolerant of small local LLM quirks:
- * - Interleaved or unclosed `<think>` / `<thought>` reasoning blocks
+ * - Interleaved, pre-opened, or unclosed `<think>` / `<thought>` / `<|channel>thought` / `<|thought|>` reasoning blocks
  * - XML `<tool_call>...</tool_call>` blocks
  * - Malformed/partial JSON inside tool calls
  * - Bare JSON or fenced JSON tool calls on flush
@@ -211,6 +228,7 @@ export class StreamOutputParser {
   private mode: 'text' | 'think' | 'tool_call' = 'text';
   private buffer = '';
   private pendingToolPayload = '';
+  private pendingPostThinkNewlineTrim = false;
   private toolCallCounter = 0;
   private lastPendingToolName: string | null = null;
   private stopped = false;
@@ -223,6 +241,7 @@ export class StreamOutputParser {
     this.stopOnToolCall = options.stopOnToolCall ?? false;
     this.allowBareJsonToolCall = options.allowBareJsonToolCall ?? true;
     this.makeToolCallId = options.makeToolCallId ?? ((idx) => `tc_${idx}`);
+    this.mode = options.initialMode ?? 'text';
   }
 
   getVisibleText(): string {
@@ -239,13 +258,7 @@ export class StreamOutputParser {
 
   pushText(chunk: string): StreamParserStepOutput {
     if (this.stopped || !chunk) {
-      return {
-        textDelta: '',
-        reasoningDelta: '',
-        pendingToolCall: null,
-        toolCallsReady: [],
-        stopSequenceHit: null,
-      };
+      return emptyStepOutput();
     }
 
     this.buffer += chunk;
@@ -254,13 +267,7 @@ export class StreamOutputParser {
 
   flush(): StreamParserStepOutput {
     if (this.stopped && !this.buffer && !this.pendingToolPayload) {
-      return {
-        textDelta: '',
-        reasoningDelta: '',
-        pendingToolCall: null,
-        toolCallsReady: [],
-        stopSequenceHit: null,
-      };
+      return emptyStepOutput();
     }
     return this.drain(true);
   }
@@ -271,6 +278,7 @@ export class StreamOutputParser {
     const toolCallsReady: ParsedToolCall[] = [];
     let pendingToolCall: { name: string } | null = null;
     let stopSequenceHit: string | null = null;
+    let visibleTextReset = false;
 
     const emitText = (s: string) => {
       if (s) {
@@ -285,26 +293,67 @@ export class StreamOutputParser {
       }
     };
 
-    while (this.buffer.length > 0 && !this.stopped) {
+    const stripPostThinkLeadingNewlines = () => {
+      this.buffer = this.buffer.replace(/^(?:\r?\n)+/, '');
+      this.pendingPostThinkNewlineTrim =
+        this.buffer.length === 0 || (!isFlush && !this.stopped && this.buffer === '\r');
+    };
+
+    while (this.buffer.length > 0) {
       // 1. Stop sequence check in text / think modes
-      if (this.mode !== 'tool_call' && this.stopSequences.length > 0) {
+      if (!this.stopped && this.mode !== 'tool_call' && this.stopSequences.length > 0) {
         const stopHit = findEarliestIndex(this.buffer, this.stopSequences);
         if (stopHit) {
           const beforeStop = this.buffer.slice(0, stopHit.index);
           this.buffer = beforeStop;
           stopSequenceHit = stopHit.tag;
           this.stopped = true;
-          // Continue loop once to drain beforeStop cleanly, then stop
+          // Continue draining beforeStop cleanly, then stop
         }
       }
 
       if (this.mode === 'text') {
-        const tagMatch = findEarliestIndex(this.buffer, [
+        if (this.pendingPostThinkNewlineTrim && this.buffer.length > 0) {
+          stripPostThinkLeadingNewlines();
+          if (this.buffer.length === 0 || this.pendingPostThinkNewlineTrim) {
+            break;
+          }
+        }
+
+        const candidateTags = [
           ...THINK_OPEN_TAGS,
+          ...THINK_CLOSE_TAGS,
           TOOL_CALL_OPEN_TAG,
-        ]);
+        ];
+        const tagMatch = findEarliestIndex(this.buffer, candidateTags);
 
         if (tagMatch) {
+          if (
+            !isFlush &&
+            !this.stopped &&
+            tagMatch.index + tagMatch.tag.length === this.buffer.length &&
+            [...candidateTags, ...this.stopSequences].some(
+              (candidate) => candidate.length > tagMatch.tag.length && candidate.startsWith(tagMatch.tag),
+            )
+          ) {
+            if (tagMatch.index > 0) {
+              emitText(this.buffer.slice(0, tagMatch.index));
+              this.buffer = this.buffer.slice(tagMatch.index);
+            }
+            break;
+          }
+
+          if (THINK_CLOSE_TAGS.includes(tagMatch.tag)) {
+            const promotedReasoning = this.fullVisibleText + this.buffer.slice(0, tagMatch.index);
+            emitReasoning(promotedReasoning);
+            this.fullVisibleText = '';
+            textOut = '';
+            visibleTextReset = true;
+            this.buffer = this.buffer.slice(tagMatch.index + tagMatch.tag.length);
+            stripPostThinkLeadingNewlines();
+            continue;
+          }
+
           emitText(this.buffer.slice(0, tagMatch.index));
           this.buffer = this.buffer.slice(tagMatch.index + tagMatch.tag.length);
           if (tagMatch.tag === TOOL_CALL_OPEN_TAG) {
@@ -325,6 +374,7 @@ export class StreamOutputParser {
 
         const holdLen = trailingPartialPrefixLength(this.buffer, [
           ...THINK_OPEN_TAGS,
+          ...THINK_CLOSE_TAGS,
           TOOL_CALL_OPEN_TAG,
           ...this.stopSequences,
         ]);
@@ -342,6 +392,9 @@ export class StreamOutputParser {
           emitReasoning(this.buffer.slice(0, closeMatch.index));
           this.buffer = this.buffer.slice(closeMatch.index + closeMatch.tag.length);
           this.mode = 'text';
+          if (this.fullVisibleText === '') {
+            stripPostThinkLeadingNewlines();
+          }
           continue;
         }
 
@@ -393,7 +446,7 @@ export class StreamOutputParser {
           continue;
         }
 
-        if (isFlush) {
+        if (isFlush || this.stopped) {
           this.pendingToolPayload += this.buffer;
           this.buffer = '';
           this.toolCallCounter += 1;
@@ -449,6 +502,7 @@ export class StreamOutputParser {
       pendingToolCall,
       toolCallsReady,
       stopSequenceHit,
+      visibleTextReset,
     };
   }
 
