@@ -11,7 +11,12 @@ import type {
   ToolExecutor,
 } from '../src/contracts.js';
 import { PrefixSlotCoordinator } from '../src/engine/speculative.js';
-import { runHarnessTurn, TurnStateMachine } from '../src/engine/turnStateMachine.js';
+import {
+  canonicalToolLoopKey,
+  runHarnessTurn,
+  ToolLoopGuard,
+  TurnStateMachine,
+} from '../src/engine/turnStateMachine.js';
 
 function createMockAdapter(
   scriptedTurns: Array<(req: GenerateRequest, signal?: AbortSignal) => AsyncIterable<StreamDelta>>,
@@ -546,5 +551,92 @@ describe('TurnStateMachine & Agentic Turn Runner', () => {
       expect(result.finalText).toBe(payload);
     }
     expect(approvalsRequested).toBe(0);
+  });
+
+  it('ToolLoopGuard halts only after 3 identical consecutive failed tool calls (ignoring key order) and allows varying/successful calls', async () => {
+    expect(canonicalToolLoopKey(['search', { b: 2, a: 1 }])).toBe(
+      canonicalToolLoopKey(['search', { a: 1, b: 2 }]),
+    );
+
+    const guard = new ToolLoopGuard();
+    guard.record('search', { a: 1, b: 2 }, { ok: false, error: 'timeout' });
+    expect(guard.blocked('search', { b: 2, a: 1 })).toBe(false);
+    guard.record('search', { b: 2, a: 1 }, { ok: false, error: 'timeout' });
+    expect(guard.blocked('search', { a: 1, b: 2 })).toBe(false);
+    guard.record('search', { a: 1, b: 2 }, { ok: false, error: 'timeout' });
+    expect(guard.blocked('search', { b: 2, a: 1 })).toBe(true);
+    expect(guard.blocked('search', { a: 1, b: 3 })).toBe(false);
+
+    // A successful call resets consecutive failure tracking
+    guard.record('search', { a: 1, b: 3 }, { ok: true });
+    expect(guard.blocked('search', { a: 1, b: 2 })).toBe(false);
+
+    // Same query with string JSON outcome
+    guard.record('search', { q: 'hf' }, '{"error":"429"}');
+    guard.record('search', { q: 'hf' }, '{"error":"429"}');
+    guard.record('search', { q: 'hf' }, '{"error":"429"}');
+    expect(guard.blocked('search', { q: 'hf' })).toBe(true);
+
+    // End-to-end turn check: 3 identical failed executions, 4th call blocked without executing, 5th different call succeeds
+    const executedArgs: string[] = [];
+    const adapter = createMockAdapter([
+      async function* () {
+        yield { type: 'text', delta: '<tool_call>{"name":"read_active_tab","arguments":{"x":1,"y":2}}</tool_call>' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+      async function* () {
+        yield { type: 'text', delta: '<tool_call>{"name":"read_active_tab","arguments":{"y":2,"x":1}}</tool_call>' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+      async function* () {
+        yield { type: 'text', delta: '<tool_call>{"name":"read_active_tab","arguments":{"x":1,"y":2}}</tool_call>' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+      async function* () {
+        yield { type: 'text', delta: '<tool_call>{"name":"read_active_tab","arguments":{"y":2,"x":1}}</tool_call>' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+      async function* () {
+        yield { type: 'text', delta: '<tool_call>{"name":"read_active_tab","arguments":{"x":2}}</tool_call>' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+      async function* () {
+        yield { type: 'text', delta: 'Recovered with updated arguments.' };
+        yield { type: 'done', finishReason: 'stop' };
+      },
+    ]);
+
+    const res = await runHarnessTurn({
+      sessionId: 'sess_loop_guard',
+      adapter,
+      messages: [{ id: 'u1', role: 'user', content: 'Try reading tab', createdAt: 1 }],
+      tools: TOOLS,
+      maxToolSteps: 6,
+      toolExecutor: {
+        listTools: () => TOOLS,
+        async execute(_name, args) {
+          executedArgs.push(canonicalToolLoopKey(args));
+          if (args.x === 1) {
+            return {
+              ok: false,
+              toolName: 'read_active_tab',
+              formatted: 'Transient failure',
+              tainted: false,
+              error: 'Transient failure',
+            };
+          }
+          return {
+            ok: true,
+            toolName: 'read_active_tab',
+            formatted: 'Tab content loaded',
+            tainted: true,
+          };
+        },
+      },
+    });
+
+    expect(executedArgs).toHaveLength(4); // 3 failed attempts for x=1, 4th blocked before execute, 5th x=2 executed
+    expect(res.toolTraces[3]?.guardDecision.triggeredRule).toBe('tool-loop-guard');
+    expect(res.finalText).toBe('Recovered with updated arguments.');
   });
 });

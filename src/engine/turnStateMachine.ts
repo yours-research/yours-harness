@@ -202,6 +202,54 @@ export interface RunHarnessTurnResult {
   transitions: TurnStateTransition[];
 }
 
+export function canonicalToolLoopKey(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalToolLoopKey).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalToolLoopKey(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * Halts identical consecutive failed tool calls after 3 unchanged failures while
+ * leaving varying arguments and successful reads unrestricted.
+ */
+export class ToolLoopGuard {
+  private failureKey?: string;
+  private repeats = 0;
+
+  blocked(toolName: string, input: unknown): boolean {
+    return this.repeats >= 3 && this.failureKey === canonicalToolLoopKey([toolName, input ?? {}]);
+  }
+
+  record(toolName: string, input: unknown, outcome: string | { ok: boolean; error?: string }): void {
+    let failed = false;
+    if (typeof outcome === 'string') {
+      try {
+        failed = Boolean(JSON.parse(outcome)?.error);
+      } catch {
+        failed = false;
+      }
+    } else {
+      failed = !outcome.ok || Boolean(outcome.error);
+    }
+
+    if (!failed) {
+      this.failureKey = undefined;
+      this.repeats = 0;
+      return;
+    }
+    const key = canonicalToolLoopKey([toolName, input ?? {}]);
+    this.repeats = key === this.failureKey ? this.repeats + 1 : 1;
+    this.failureKey = key;
+  }
+}
+
 function buildFallbackToolDefinition(name: string): ToolDefinition {
   return {
     name,
@@ -271,6 +319,7 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
   const history: HarnessMessage[] = params.messages.map((m) => ({ ...m }));
   const newMessages: HarnessMessage[] = [];
   const toolTraces: ExecutedToolTrace[] = [];
+  const toolLoopGuard = new ToolLoopGuard();
 
   let rollingSummary: string | null = params.previousRollingSummary ?? null;
   let rollingSummaryCutoffId: string | null = params.previousRollingSummaryCutoffId ?? null;
@@ -580,6 +629,44 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
           params.toolExecutor.getTool?.(call.name) ??
           buildFallbackToolDefinition(call.name);
 
+        if (toolLoopGuard.blocked(call.name, call.arguments)) {
+          deniedByUserOrGuard = true;
+          const loopReason = `Blocked "${call.name}" after 3 identical consecutive failures with unchanged arguments.`;
+          const loopGuardDecision: GuardDecision = {
+            verdict: 'deny',
+            reason: loopReason,
+            triggeredRule: 'tool-loop-guard',
+          };
+          const loopResult: ToolExecutionResult = {
+            ok: false,
+            toolName: call.name,
+            formatted: `Tool call "${call.name}" halted: ${loopReason}`,
+            tainted: false,
+            error: loopReason,
+          };
+          const trace: ExecutedToolTrace = {
+            step,
+            call,
+            result: loopResult,
+            guardDecision: loopGuardDecision,
+            durationMs: 0,
+          };
+          toolTraces.push(trace);
+          params.onToolCallResult?.(trace);
+
+          const toolMsg: HarnessMessage = {
+            id: createId('msg'),
+            role: 'tool',
+            toolName: call.name,
+            toolCallId: call.id,
+            content: loopResult.formatted,
+            createdAt: Date.now(),
+          };
+          history.push(toolMsg);
+          newMessages.push(toolMsg);
+          continue;
+        }
+
         let guardDecision: GuardDecision = {
           verdict: 'allow',
           reason: 'No guard engine configured',
@@ -698,6 +785,10 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
           sessionId: params.sessionId,
           origin: params.activeOrigin,
           abortSignal: localController.signal,
+        });
+        toolLoopGuard.record(call.name, call.arguments, {
+          ok: rawResult.ok,
+          error: rawResult.error,
         });
 
         let formattedContent = rawResult.formatted;

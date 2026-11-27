@@ -23,6 +23,8 @@ export {
   type PrefixSlotCoordinatorOptions,
 } from './speculative.js';
 export {
+  canonicalToolLoopKey,
+  ToolLoopGuard,
   TurnStateMachine,
   runHarnessTurn,
   type TurnState,
