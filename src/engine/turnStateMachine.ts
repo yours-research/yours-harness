@@ -157,6 +157,8 @@ export interface RunHarnessTurnParams {
   slotCoordinator?: PrefixSlotCoordinator;
   autoWarmSlot0InTurn?: boolean;
   stopOnToolCall?: boolean;
+  /** Allow recovering bare JSON tool calls without <tool_call> tags (default: false). */
+  allowBareJsonToolCall?: boolean;
   waitForMemoryConsolidation?: boolean;
   activeOrigin?: string;
   explicitlyApprovedOrigins?: string[];
@@ -365,6 +367,8 @@ export async function runHarnessTurn(params: RunHarnessTurnParams): Promise<RunH
       const parser = new StreamOutputParser({
         stopSequences: params.stopSequences,
         stopOnToolCall,
+        // Tagged <tool_call> protocol only unless explicitly opted in.
+        allowBareJsonToolCall: params.allowBareJsonToolCall ?? false,
       });
 
       const nativeToolCalls: ParsedToolCall[] = [];

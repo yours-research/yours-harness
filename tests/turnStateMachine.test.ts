@@ -511,4 +511,40 @@ describe('TurnStateMachine & Agentic Turn Runner', () => {
     expect(result2.finalState).toBe('done');
     expect(inspectCalls).toBe(0);
   });
+
+  it('keeps bare and fenced profile JSON as plain visible text without triggering tool calls or approval (RC1 P3)', async () => {
+    const bareJson = '{"name":"Ana","age":31,"city":"Lisbon"}';
+    const fencedJson = '```json\n{"name":"Ana","age":31,"city":"Lisbon"}\n```';
+    let approvalsRequested = 0;
+
+    for (const payload of [bareJson, fencedJson]) {
+      const adapter = createMockAdapter([
+        async function* () {
+          yield { type: 'text', delta: payload };
+          yield { type: 'done', finishReason: 'stop' };
+        },
+      ]);
+      const result = await runHarnessTurn({
+        sessionId: 'sess_bare_json',
+        adapter,
+        messages: [{ id: 'u1', role: 'user', content: 'Return ONLY JSON for Ana', createdAt: 1 }],
+        tools: TOOLS,
+        toolExecutor: {
+          listTools: () => TOOLS,
+          async execute() {
+            throw new Error('Must not execute any tool for bare JSON');
+          },
+        },
+        onApprovalRequired: async () => {
+          approvalsRequested += 1;
+          return false;
+        },
+      });
+      expect(result.finalState).toBe('done');
+      expect(result.finishReason).toBe('stop');
+      expect(result.toolTraces).toHaveLength(0);
+      expect(result.finalText).toBe(payload);
+    }
+    expect(approvalsRequested).toBe(0);
+  });
 });

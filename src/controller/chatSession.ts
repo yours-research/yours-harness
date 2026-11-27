@@ -56,6 +56,7 @@ export interface ChatSessionOptions {
   enableThinking?: boolean;
   pacingMode?: GpuPacingMode;
   persistAbortedPartial?: boolean;
+  allowBareJsonToolCall?: boolean;
 }
 
 export type ChatSessionUpdateOptions = Partial<
@@ -123,6 +124,7 @@ export class ChatSession {
   private enableThinking?: boolean;
   private pacingMode?: GpuPacingMode;
   private readonly persistAbortedPartial: boolean;
+  private readonly allowBareJsonToolCall: boolean;
 
   private readonly fsm = new TurnStateMachine();
   private readonly listeners = new Set<() => void>();
@@ -174,6 +176,7 @@ export class ChatSession {
     this.enableThinking = options.enableThinking;
     this.pacingMode = options.pacingMode;
     this.persistAbortedPartial = options.persistAbortedPartial ?? false;
+    this.allowBareJsonToolCall = options.allowBareJsonToolCall ?? false;
 
     this.slotCoordinator = new PrefixSlotCoordinator({
       adapter: this.adapter,
@@ -642,6 +645,7 @@ export class ChatSession {
         temperature: this.temperature,
         topP: this.topP,
         topK: this.topK,
+        allowBareJsonToolCall: this.allowBareJsonToolCall,
         enableThinking: options?.enableThinking ?? this.enableThinking,
         pacingMode: this.pacingMode,
         previousRollingSummary: thread.rollingSummary,

@@ -548,7 +548,7 @@ describe('ChatSession & React Hook Integration', () => {
         },
       };
 
-      const session = new ChatSession({ adapter, store, toolExecutor });
+      const session = new ChatSession({ adapter, store, toolExecutor, allowBareJsonToolCall: true });
       await session.init();
 
       const streamingHistory: string[] = [];
